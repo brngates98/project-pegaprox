@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Question / Support
+    url: https://github.com/PegaProx/project-pegaprox/issues
+    about: Please use Discussions for general questions and support — Issues are for bugs and feature requests only.
+  - name: 💖 Sponsor PegaProx
+    url: https://pegaprox.com/#sponsor
+    about: Help us dedicate more time to PegaProx by becoming a sponsor!
+  - name: 📖 Documentation
+    url: https://docs.pegaprox.com
+    about: Check the docs first — your answer might already be there.
