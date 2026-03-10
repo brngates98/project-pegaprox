@@ -439,6 +439,20 @@ class XcpngManager:
                 except Exception:
                     pass
 
+            # guest metrics for IP addresses (cheap XAPI call)
+            guest_ips = []
+            gm_ref = rec.get('guest_metrics', 'OpaqueRef:NULL')
+            if gm_ref != 'OpaqueRef:NULL' and power == 'Running':
+                try:
+                    gm_nets = api.VM_guest_metrics.get_networks(gm_ref)
+                    _seen = set()
+                    for gk, gv in gm_nets.items():
+                        if '/ip' in gk and gv not in _seen:
+                            _seen.add(gv)
+                            guest_ips.append(gv)
+                except Exception:
+                    pass
+
             vms.append({
                 'vmid': vmid,
                 'name': _sanitize_str(rec.get('name_label', '')),
@@ -452,12 +466,13 @@ class XcpngManager:
                 'disk': 0,
                 'maxdisk': disk_total,
                 'uptime': vm_uptime,
-                'netin': 0,   # needs per-VIF query_data_source, too expensive per-VM
+                'netin': 0,
                 'netout': 0,
                 'template': '',
                 'tags': [],
                 'lock': '',
                 'uuid': vm_uuid,
+                'ip_addresses': guest_ips,
                 '_ref': ref,
             })
         return vms
@@ -2123,6 +2138,482 @@ class XcpngManager:
         except Exception as e:
             self.logger.error(f"upload_to_storage: {e}")
             return {'success': False, 'error': str(e)}
+
+    # ──────────────────────────────────────────
+    # RRD metrics - NS Mar 2026
+    # XCP-ng exposes per-host and per-VM RRD via HTTP
+    # ──────────────────────────────────────────
+
+    def _rrd_fetch(self, path, params=None):
+        """Fetch RRD XML from XCP-ng host and parse into rows."""
+        import xml.etree.ElementTree as ET
+        import requests as _req
+
+        host_url = f"https://{self.current_host or self.config.host}"
+        with self._session_lock:
+            if not self._session:
+                return None, None
+            sid = self._session._session
+
+        p = {'session_id': sid}
+        if params:
+            p.update(params)
+
+        try:
+            resp = _req.get(f"{host_url}/{path}", params=p, verify=False, timeout=15)
+            if resp.status_code != 200:
+                return None, None
+            root = ET.fromstring(resp.text)
+        except Exception as e:
+            self.logger.error(f"_rrd_fetch {path}: {e}")
+            return None, None
+
+        meta = root.find('meta')
+        if meta is None:
+            return None, None
+
+        legends = []
+        leg_el = meta.find('legend')
+        if leg_el is not None:
+            legends = [e.text or '' for e in leg_el.findall('entry')]
+
+        rows = []
+        data_el = root.find('data')
+        if data_el is not None:
+            for row in data_el.findall('row'):
+                t_el = row.find('t')
+                vals = row.findall('v')
+                if t_el is None:
+                    continue
+                ts = int(t_el.text)
+                values = []
+                for v in vals:
+                    try:
+                        values.append(float(v.text) if v.text and v.text != 'NaN' else 0.0)
+                    except (ValueError, TypeError):
+                        values.append(0.0)
+                rows.append((ts, values))
+
+        return legends, rows
+
+    def get_vm_rrd(self, node, vmid, vm_type='qemu', timeframe='hour'):
+        """Get VM metrics - matches PegaProxManager output shape."""
+        db = get_db()
+        vm_uuid = db.xcpng_resolve_vmid(self.id, vmid)
+        if not vm_uuid:
+            return {'success': False, 'error': f'VM {vmid} not found'}
+
+        tf_seconds = {'hour': 3600, 'day': 86400, 'week': 604800,
+                      'month': 2592000, 'year': 31536000}
+        start = int(time.time()) - tf_seconds.get(timeframe, 3600)
+
+        legends, rows = self._rrd_fetch('rrd_updates', {
+            'start': start, 'cf': 'AVERAGE', 'host': 'false'
+        })
+        if legends is None:
+            return {'success': False, 'error': 'Could not fetch RRD data'}
+
+        # filter legend entries for this VM uuid
+        vm_prefix = f"AVERAGE:vm:{vm_uuid}:"
+        col_map = {}
+        for i, leg in enumerate(legends):
+            if leg.startswith(vm_prefix):
+                metric = leg[len(vm_prefix):]
+                col_map[metric] = i
+
+        formatted = {
+            'timeframe': timeframe, 'vmid': vmid, 'node': node,
+            'type': vm_type,
+            'metrics': {
+                'cpu': [], 'memory': [],
+                'disk_read': [], 'disk_write': [],
+                'net_in': [], 'net_out': []
+            },
+            'timestamps': []
+        }
+
+        # aggregate multi-vif / multi-vbd columns
+        cpu_cols = [i for m, i in col_map.items() if m.startswith('cpu')]
+        netin_cols = [i for m, i in col_map.items() if m.startswith('vif_') and m.endswith('_rx')]
+        netout_cols = [i for m, i in col_map.items() if m.startswith('vif_') and m.endswith('_tx')]
+        dkr_cols = [i for m, i in col_map.items() if m.startswith('vbd_') and m.endswith('_read')]
+        dkw_cols = [i for m, i in col_map.items() if m.startswith('vbd_') and m.endswith('_write')]
+        mem_col = col_map.get('memory', None)
+        mem_target = col_map.get('memory_target', None)
+        mem_free_col = col_map.get('memory_internal_free', None)
+
+        for ts, vals in rows:
+            formatted['timestamps'].append(ts)
+            # cpu: XCP-ng gives fraction per vcpu
+            cpu_val = sum(vals[c] for c in cpu_cols) / max(len(cpu_cols), 1) if cpu_cols else 0
+            formatted['metrics']['cpu'].append(round(cpu_val * 100, 2))
+
+            # memory percent
+            if mem_col is not None and mem_target is not None:
+                used = vals[mem_col]
+                target = vals[mem_target] if vals[mem_target] > 0 else 1
+                formatted['metrics']['memory'].append(round(used / target * 100, 2))
+            elif mem_free_col is not None and mem_col is not None:
+                total_kib = vals[mem_col] / 1024 if vals[mem_col] > 1024 else vals[mem_col]
+                free_kib = vals[mem_free_col]
+                pct = ((total_kib - free_kib) / total_kib * 100) if total_kib > 0 else 0
+                formatted['metrics']['memory'].append(round(max(0, min(100, pct)), 2))
+            else:
+                formatted['metrics']['memory'].append(0)
+
+            formatted['metrics']['net_in'].append(sum(vals[c] for c in netin_cols))
+            formatted['metrics']['net_out'].append(sum(vals[c] for c in netout_cols))
+            formatted['metrics']['disk_read'].append(sum(vals[c] for c in dkr_cols))
+            formatted['metrics']['disk_write'].append(sum(vals[c] for c in dkw_cols))
+
+        return {'success': True, 'data': formatted}
+
+    def get_node_rrddata(self, node: str, timeframe: str = 'hour'):
+        """Get node metrics - same output shape as PegaProxManager."""
+        tf_seconds = {'hour': 3600, 'day': 86400, 'week': 604800,
+                      'month': 2592000, 'year': 31536000}
+        start = int(time.time()) - tf_seconds.get(timeframe, 3600)
+
+        # resolve node -> host UUID
+        api = self._api()
+        host_uuid = None
+        if api:
+            try:
+                for href in api.host.get_all():
+                    hn = api.host.get_hostname(href)
+                    if hn == node or api.host.get_name_label(href) == node:
+                        host_uuid = api.host.get_uuid(href)
+                        break
+            except Exception:
+                pass
+
+        legends, rows = self._rrd_fetch('rrd_updates', {
+            'start': start, 'cf': 'AVERAGE', 'host': 'true'
+        })
+        if legends is None:
+            return {'success': False, 'error': 'Could not fetch RRD data'}
+
+        host_prefix = f"AVERAGE:host:{host_uuid}:" if host_uuid else "AVERAGE:host:"
+        col_map = {}
+        for i, leg in enumerate(legends):
+            if host_uuid:
+                if leg.startswith(host_prefix):
+                    col_map[leg[len(host_prefix):]] = i
+            elif ':host:' in leg:
+                parts = leg.split(':')
+                if len(parts) >= 4:
+                    col_map[parts[3]] = i
+
+        formatted = {
+            'timeframe': timeframe, 'node': node,
+            'metrics': {
+                'cpu': [], 'memory': [], 'swap': [],
+                'iowait': [], 'loadavg': [],
+                'net_in': [], 'net_out': [], 'rootfs': []
+            },
+            'timestamps': []
+        }
+
+        cpu_cols = [i for m, i in col_map.items() if m.startswith('cpu') and not m.startswith('cpu_avg')]
+        cpu_avg_col = col_map.get('cpu_avg', None)
+        mem_total_col = col_map.get('memory_total_kib', None)
+        mem_free_col = col_map.get('memory_free_kib', None)
+        loadavg_col = col_map.get('loadavg', None)
+        netin_cols = [i for m, i in col_map.items() if m.startswith('pif_') and m.endswith('_rx')]
+        netout_cols = [i for m, i in col_map.items() if m.startswith('pif_') and m.endswith('_tx')]
+
+        for ts, vals in rows:
+            formatted['timestamps'].append(ts)
+
+            if cpu_avg_col is not None:
+                formatted['metrics']['cpu'].append(round(vals[cpu_avg_col] * 100, 2))
+            elif cpu_cols:
+                avg = sum(vals[c] for c in cpu_cols) / len(cpu_cols)
+                formatted['metrics']['cpu'].append(round(avg * 100, 2))
+            else:
+                formatted['metrics']['cpu'].append(0)
+
+            if mem_total_col is not None and mem_free_col is not None:
+                total = vals[mem_total_col]
+                free = vals[mem_free_col]
+                pct = ((total - free) / total * 100) if total > 0 else 0
+                formatted['metrics']['memory'].append(round(pct, 2))
+            else:
+                formatted['metrics']['memory'].append(0)
+
+            # XCP-ng dom0 doesn't expose swap/iowait the same way
+            formatted['metrics']['swap'].append(0)
+            formatted['metrics']['iowait'].append(0)
+            formatted['metrics']['loadavg'].append(round(vals[loadavg_col], 2) if loadavg_col is not None else 0)
+            formatted['metrics']['rootfs'].append(0)
+
+            formatted['metrics']['net_in'].append(sum(vals[c] for c in netin_cols))
+            formatted['metrics']['net_out'].append(sum(vals[c] for c in netout_cols))
+
+        return {'success': True, 'data': formatted}
+
+    # ──────────────────────────────────────────
+    # Guest metrics (IP, OS, PV driver status)
+    # ──────────────────────────────────────────
+
+    def get_guest_metrics(self, node, vmid, vm_type='qemu'):
+        """Get guest agent info for a VM - IP, OS, PV drivers."""
+        api = self._api()
+        if not api:
+            return {}
+        try:
+            ref = self._resolve_vm(vmid)
+            gm_ref = api.VM.get_guest_metrics(ref)
+            if gm_ref == 'OpaqueRef:NULL':
+                return {'pv_drivers_detected': False, 'networks': {}, 'os_version': {}}
+
+            rec = api.VM_guest_metrics.get_record(gm_ref)
+            networks = rec.get('networks', {})
+            os_ver = rec.get('os_version', {})
+            pv_version = rec.get('PV_drivers_version', {})
+            memory = rec.get('memory', {})
+
+            # flatten network map: {'0/ip': '10.0.0.1', '0/ipv6/0': '...'} -> list
+            ips = []
+            seen = set()
+            for k, v in networks.items():
+                if '/ip' in k and v not in seen:
+                    seen.add(v)
+                    ips.append(v)
+
+            return {
+                'pv_drivers_detected': bool(pv_version),
+                'pv_drivers_version': pv_version.get('major', '') + '.' + pv_version.get('minor', '') if pv_version else '',
+                'pv_drivers_up_to_date': rec.get('PV_drivers_up_to_date', False),
+                'ip_addresses': ips,
+                'networks': networks,
+                'os_version': os_ver,
+                'os_name': os_ver.get('name', ''),
+                'memory': memory,
+                'live': rec.get('live', False),
+            }
+        except Exception as e:
+            self.logger.error(f"get_guest_metrics {vmid}: {e}")
+            return {}
+
+    # ──────────────────────────────────────────
+    # Pool HA - MK Mar 2026
+    # ──────────────────────────────────────────
+
+    def get_ha_status(self) -> Dict:
+        """Get pool HA status including per-VM restart priorities."""
+        api = self._api()
+        if not api:
+            return {'enabled': False, 'error': 'Not connected'}
+        try:
+            pool_refs = api.pool.get_all()
+            if not pool_refs:
+                return {'enabled': False}
+            pool = api.pool.get_record(pool_refs[0])
+
+            ha_enabled = pool.get('ha_enabled', False)
+            result = {
+                'enabled': ha_enabled,
+                'allow_overcommit': pool.get('ha_allow_overcommit', False),
+                'overcommitted': pool.get('ha_overcommitted', False),
+                'host_failures_to_tolerate': int(pool.get('ha_host_failures_to_tolerate', 0)),
+                'plan_exists_for': int(pool.get('ha_plan_exists_for', 0)),
+                'ha_statefiles': pool.get('ha_statefiles', []),
+            }
+
+            if ha_enabled:
+                vm_ha = []
+                for vm_ref in api.VM.get_all():
+                    try:
+                        if api.VM.get_is_a_template(vm_ref):
+                            continue
+                        if api.VM.get_is_control_domain(vm_ref):
+                            continue
+                        prio = api.VM.get_ha_restart_priority(vm_ref)
+                        if prio:
+                            name = api.VM.get_name_label(vm_ref)
+                            uuid = api.VM.get_uuid(vm_ref)
+                            db = get_db()
+                            vmid = db.xcpng_get_vmid(self.id, uuid)
+                            vm_ha.append({
+                                'vmid': vmid,
+                                'name': name,
+                                'uuid': uuid,
+                                'restart_priority': prio,
+                                'order': int(api.VM.get_order(vm_ref) or 0),
+                                'start_delay': int(api.VM.get_start_delay(vm_ref) or 0),
+                            })
+                    except Exception:
+                        continue
+                result['protected_vms'] = vm_ha
+
+            return result
+        except Exception as e:
+            self.logger.error(f"get_ha_status: {e}")
+            return {'enabled': False, 'error': str(e)}
+
+    def set_vm_ha_restart_priority(self, vmid, priority: str):
+        """Set HA restart priority for a VM.
+        priority: 'restart', 'best-effort', '' (disabled)
+        """
+        api = self._api()
+        if not api:
+            return {'success': False, 'error': 'Not connected'}
+        try:
+            ref = self._resolve_vm(vmid)
+            api.VM.set_ha_restart_priority(ref, priority)
+            self.logger.info(f"Set HA priority for VM {vmid} to '{priority}'")
+            return {'success': True}
+        except Exception as e:
+            self.logger.error(f"set_vm_ha_restart_priority {vmid}: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def enable_pool_ha(self, heartbeat_srs=None, host_failures_to_tolerate=1):
+        """Enable HA on the pool. heartbeat_srs: list of SR refs for state files."""
+        api = self._api()
+        if not api:
+            return {'success': False, 'error': 'Not connected'}
+        try:
+            sr_refs = []
+            if heartbeat_srs:
+                for sr_id in heartbeat_srs:
+                    try:
+                        sr_refs.append(api.SR.get_by_uuid(sr_id))
+                    except Exception:
+                        found = api.SR.get_by_name_label(sr_id)
+                        if found:
+                            sr_refs.append(found[0])
+
+            config = {'timeout': '30'}
+            api.pool.enable_ha(sr_refs, config)
+            pool_refs = api.pool.get_all()
+            if pool_refs:
+                api.pool.set_ha_host_failures_to_tolerate(pool_refs[0], host_failures_to_tolerate)
+            self.logger.info(f"Pool HA enabled (tolerance={host_failures_to_tolerate})")
+            return {'success': True}
+        except Exception as e:
+            self.logger.error(f"enable_pool_ha: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def disable_pool_ha(self):
+        api = self._api()
+        if not api:
+            return {'success': False, 'error': 'Not connected'}
+        try:
+            api.pool.disable_ha()
+            self.logger.info("Pool HA disabled")
+            return {'success': True}
+        except Exception as e:
+            self.logger.error(f"disable_pool_ha: {e}")
+            return {'success': False, 'error': str(e)}
+
+    # ──────────────────────────────────────────
+    # PIF / physical network interfaces
+    # LW: per-node physical NIC info, bonds, VLANs
+    # ──────────────────────────────────────────
+
+    def get_host_pifs(self, node_name) -> list:
+        """Get physical interfaces for a host."""
+        api = self._api()
+        if not api:
+            return []
+        try:
+            host_ref = None
+            for href in api.host.get_all():
+                if api.host.get_hostname(href) == node_name or \
+                   api.host.get_name_label(href) == node_name:
+                    host_ref = href
+                    break
+            if not host_ref:
+                return []
+
+            pifs = []
+            for pif_ref in api.PIF.get_all():
+                rec = api.PIF.get_record(pif_ref)
+                if rec.get('host') != host_ref:
+                    continue
+                pifs.append({
+                    'uuid': rec.get('uuid', ''),
+                    'device': rec.get('device', ''),
+                    'MAC': rec.get('MAC', ''),
+                    'MTU': int(rec.get('MTU', 1500)),
+                    'VLAN': int(rec.get('VLAN', -1)),
+                    'ip': rec.get('IP', ''),
+                    'netmask': rec.get('netmask', ''),
+                    'gateway': rec.get('gateway', ''),
+                    'DNS': rec.get('DNS', ''),
+                    'ip_configuration_mode': rec.get('ip_configuration_mode', ''),
+                    'ipv6': rec.get('IPv6', []),
+                    'currently_attached': rec.get('currently_attached', False),
+                    'physical': rec.get('physical', False),
+                    'management': rec.get('management', False),
+                    'bond_slave_of': rec.get('bond_slave_of', 'OpaqueRef:NULL') != 'OpaqueRef:NULL',
+                    'speed': int(rec.get('speed', 0)),
+                    'duplex': rec.get('duplex', 'unknown'),
+                    'carrier': rec.get('carrier', False),
+                    'vendor_name': rec.get('vendor_name', ''),
+                    'device_name': rec.get('device_name', ''),
+                })
+            return sorted(pifs, key=lambda p: p['device'])
+        except Exception as e:
+            self.logger.error(f"get_host_pifs {node_name}: {e}")
+            return []
+
+    def get_bonds(self, node_name) -> list:
+        """Get bond interfaces for a host."""
+        api = self._api()
+        if not api:
+            return []
+        try:
+            host_ref = None
+            for href in api.host.get_all():
+                if api.host.get_hostname(href) == node_name or \
+                   api.host.get_name_label(href) == node_name:
+                    host_ref = href
+                    break
+            if not host_ref:
+                return []
+
+            bonds = []
+            for bond_ref in api.Bond.get_all():
+                rec = api.Bond.get_record(bond_ref)
+                master_ref = rec.get('master', 'OpaqueRef:NULL')
+                if master_ref == 'OpaqueRef:NULL':
+                    continue
+                try:
+                    master_host = api.PIF.get_host(master_ref)
+                    if master_host != host_ref:
+                        continue
+                except Exception:
+                    continue
+
+                slaves = []
+                for s_ref in rec.get('slaves', []):
+                    try:
+                        slaves.append(api.PIF.get_device(s_ref))
+                    except Exception:
+                        pass
+
+                bonds.append({
+                    'uuid': rec.get('uuid', ''),
+                    'master': api.PIF.get_device(master_ref),
+                    'mode': rec.get('mode', 'balance-slb'),
+                    'slaves': slaves,
+                    'primary_slave': rec.get('primary_slave', ''),
+                })
+            return bonds
+        except Exception as e:
+            self.logger.error(f"get_bonds {node_name}: {e}")
+            return []
+
+    # ──────────────────────────────────────────
+    # VM guest agent - enrich VM list with IPs
+    # ──────────────────────────────────────────
+
+    def get_vm_addresses(self, vmid) -> list:
+        """Return list of IP addresses from guest agent."""
+        gm = self.get_guest_metrics(None, vmid)
+        return gm.get('ip_addresses', [])
 
     # ──────────────────────────────────────────
     # Proxmox-specific stubs (no-ops for XCP-ng)
