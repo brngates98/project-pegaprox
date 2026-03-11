@@ -1061,7 +1061,12 @@
                     formData.append('reverse_proxy_enabled', serverSettings.reverse_proxy_enabled);
                     formData.append('trusted_proxies', serverSettings.trusted_proxies || '');
                     formData.append('default_theme', serverSettings.default_theme || 'proxmoxDark');
-                    
+                    // NS: alert recipients live in the same tab - must send them too (#131)
+                    formData.append('alert_email_recipients', JSON.stringify(serverSettings.alert_email_recipients || []));
+                    if (serverSettings.alert_cooldown) {
+                        formData.append('alert_cooldown', serverSettings.alert_cooldown);
+                    }
+
                     if (serverSettings.ssl_cert_file) {
                         formData.append('ssl_cert', serverSettings.ssl_cert_file);
                     }

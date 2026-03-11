@@ -423,7 +423,8 @@ def apply_hardening(cluster_id, node):
     if not controls:
         return jsonify({'error': 'No controls specified'}), 400
 
-    results = mgr.apply_node_hardening(node, controls)
+    ctrl_params = data.get('params', {})
+    results = mgr.apply_node_hardening(node, controls, params=ctrl_params)
     ok_count = sum(1 for v in results.values() if v.get('success'))
 
     from pegaprox.utils.audit import log_audit

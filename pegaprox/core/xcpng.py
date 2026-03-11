@@ -7,6 +7,7 @@ NS: Mar 2026 - first-class XCP-ng integration, same sidebar as Proxmox.
 """
 
 import logging
+import os
 import threading
 import time
 import uuid as _uuid
@@ -88,6 +89,7 @@ class XcpngManager:
         # node/vm caches
         self._cached_nodes = None
         self._nodes_cache_time = 0
+        self._net_accum = {}  # LW: accumulate rate→cumulative for frontend compat
         self._nodes_cache_ttl = 8  # seconds, same as PegaProxManager
         self._cached_vms = None
         self._vms_cache_time = 0
@@ -102,6 +104,7 @@ class XcpngManager:
         self.ha_lock = threading.Lock()
         self.ha_recovery_in_progress = {}
         self._cached_node_dict = {}
+        self.last_migration_log = []
 
         # task tracking - xapi opaque refs -> our task dicts
         self._active_tasks = {}
@@ -264,6 +267,7 @@ class XcpngManager:
             self._cached_vms = self._fetch_vms(api)
             self._nodes_cache_time = now
             self._vms_cache_time = now
+            self._consecutive_failures = 0
         except Exception as e:
             self.logger.error(f"Cache refresh failed: {e}")
             self._consecutive_failures += 1
@@ -295,14 +299,18 @@ class XcpngManager:
             # NS: query_data_source for live CPU avg (fraction 0-1)
             cpu_util = 0
             try:
-                cpu_util = float(api.host.query_data_source(ref, 'cpu_avg'))
+                v = float(api.host.query_data_source(ref, 'cpu_avg'))
+                if v == v:  # NaN check (nan != nan)
+                    cpu_util = v
             except Exception:
                 pass
 
             # uptime - try data source first, fallback to other_config boot_time
             uptime_secs = 0
             try:
-                uptime_secs = int(float(api.host.query_data_source(ref, 'uptime')))
+                v = float(api.host.query_data_source(ref, 'uptime'))
+                if v == v:
+                    uptime_secs = int(v)
             except Exception:
                 try:
                     bt = rec.get('other_config', {}).get('boot_time', '')
@@ -320,13 +328,28 @@ class XcpngManager:
                     if not dev:
                         continue
                     # bytes/sec from XAPI data source
-                    netin += max(0, float(api.host.query_data_source(ref, f'pif_{dev}_rx')))
-                    netout += max(0, float(api.host.query_data_source(ref, f'pif_{dev}_tx')))
+                    rx = float(api.host.query_data_source(ref, f'pif_{dev}_rx'))
+                    tx = float(api.host.query_data_source(ref, f'pif_{dev}_tx'))
+                    if rx == rx: netin += max(0, rx)
+                    if tx == tx: netout += max(0, tx)
                 except Exception:
                     pass
 
+            # LW: frontend expects cumulative byte counters (like Proxmox), not rates
+            # accumulate rate * dt to simulate cumulative values
+            hostname = _sanitize_str(rec.get('hostname', rec.get('name_label', '')))
+            now = time.time()
+            if hostname not in self._net_accum:
+                self._net_accum[hostname] = {'in': 0, 'out': 0, 't': now}
+            acc = self._net_accum[hostname]
+            dt = now - acc['t']
+            if dt > 0 and dt < 120:  # skip if gap too large (reconnect etc)
+                acc['in'] += netin * dt
+                acc['out'] += netout * dt
+            acc['t'] = now
+
             nodes.append({
-                'node': _sanitize_str(rec.get('hostname', rec.get('name_label', ''))),
+                'node': hostname,
                 'status': 'online' if rec.get('enabled', True) else 'offline',
                 'id': _sanitize_str(rec.get('uuid', '')),
                 'cpu': cpu_util,
@@ -334,8 +357,8 @@ class XcpngManager:
                 'mem': mem_total - mem_free,
                 'maxmem': mem_total,
                 'uptime': uptime_secs,
-                'netin': netin,   # bytes/sec (rate, not cumulative)
-                'netout': netout,
+                'netin': acc['in'],
+                'netout': acc['out'],
                 'type': 'node',
                 '_ref': ref,
             })
@@ -601,9 +624,9 @@ class XcpngManager:
             name = n.get('node', '')
             maxmem = n.get('maxmem', 0)
             mem_used = n.get('mem', 0)
-            cpu_frac = n.get('cpu', 0)
+            cpu_frac = n.get('cpu', 0) or 0  # guard against NaN/None
             mem_pct = round(mem_used / maxmem * 100, 1) if maxmem else 0
-            cpu_pct = round(cpu_frac * 100, 1)
+            cpu_pct = round(cpu_frac * 100, 1) if cpu_frac == cpu_frac else 0
             result[name] = {
                 'status': n.get('status', 'unknown'),
                 'cpu_percent': cpu_pct,
@@ -623,8 +646,11 @@ class XcpngManager:
         return result
 
     def get_vm_resources(self) -> list:
-        """Return VM list for broadcast loop - same format as Proxmox /cluster/resources."""
-        return self.get_vms() or []
+        """Return VM+node list for broadcast loop - same format as Proxmox /cluster/resources.
+        MK: include nodes so SSE doesn't think connection is stale when cluster has zero VMs."""
+        vms = self.get_vms() or []
+        nodes = self.get_nodes() or []
+        return vms + nodes
 
     # ──────────────────────────────────────────
     # VM Lifecycle
@@ -645,55 +671,79 @@ class XcpngManager:
         api = self._api()
         if not api:
             return None
-        ref = self._resolve_vm(vmid)
-        # start paused=False, force=False
-        task_ref = api.Async.VM.start(ref, False, False)
-        task_id = self._track_task(task_ref, 'start_vm', vmid)
-        self.logger.info(f"Starting VM {vmid}")
-        return task_id
+        try:
+            ref = self._resolve_vm(vmid)
+            # start paused=False, force=False
+            task_ref = api.Async.VM.start(ref, False, False)
+            task_id = self._track_task(task_ref, 'start_vm', vmid)
+            self.logger.info(f"Starting VM {vmid}")
+            return task_id
+        except Exception as e:
+            self.logger.error(f"start_vm {vmid}: {e}")
+            return None
 
     def stop_vm(self, node, vmid) -> str:
         """Hard shutdown."""
         api = self._api()
         if not api:
             return None
-        ref = self._resolve_vm(vmid)
-        task_ref = api.Async.VM.hard_shutdown(ref)
-        return self._track_task(task_ref, 'stop_vm', vmid)
+        try:
+            ref = self._resolve_vm(vmid)
+            task_ref = api.Async.VM.hard_shutdown(ref)
+            return self._track_task(task_ref, 'stop_vm', vmid)
+        except Exception as e:
+            self.logger.error(f"stop_vm {vmid}: {e}")
+            return None
 
     def shutdown_vm(self, node, vmid) -> str:
         """Clean shutdown (ACPI)."""
         api = self._api()
         if not api:
             return None
-        ref = self._resolve_vm(vmid)
-        task_ref = api.Async.VM.clean_shutdown(ref)
-        return self._track_task(task_ref, 'shutdown_vm', vmid)
+        try:
+            ref = self._resolve_vm(vmid)
+            task_ref = api.Async.VM.clean_shutdown(ref)
+            return self._track_task(task_ref, 'shutdown_vm', vmid)
+        except Exception as e:
+            self.logger.error(f"shutdown_vm {vmid}: {e}")
+            return None
 
     def reboot_vm(self, node, vmid) -> str:
         api = self._api()
         if not api:
             return None
-        ref = self._resolve_vm(vmid)
-        task_ref = api.Async.VM.clean_reboot(ref)
-        return self._track_task(task_ref, 'reboot_vm', vmid)
+        try:
+            ref = self._resolve_vm(vmid)
+            task_ref = api.Async.VM.clean_reboot(ref)
+            return self._track_task(task_ref, 'reboot_vm', vmid)
+        except Exception as e:
+            self.logger.error(f"reboot_vm {vmid}: {e}")
+            return None
 
     def suspend_vm(self, node, vmid) -> str:
         api = self._api()
         if not api:
             return None
-        ref = self._resolve_vm(vmid)
-        task_ref = api.Async.VM.suspend(ref)
-        return self._track_task(task_ref, 'suspend_vm', vmid)
+        try:
+            ref = self._resolve_vm(vmid)
+            task_ref = api.Async.VM.suspend(ref)
+            return self._track_task(task_ref, 'suspend_vm', vmid)
+        except Exception as e:
+            self.logger.error(f"suspend_vm {vmid}: {e}")
+            return None
 
     def resume_vm(self, node, vmid) -> str:
         api = self._api()
         if not api:
             return None
-        ref = self._resolve_vm(vmid)
-        # start_paused=False, force=False
-        task_ref = api.Async.VM.resume(ref, False, False)
-        return self._track_task(task_ref, 'resume_vm', vmid)
+        try:
+            ref = self._resolve_vm(vmid)
+            # start_paused=False, force=False
+            task_ref = api.Async.VM.resume(ref, False, False)
+            return self._track_task(task_ref, 'resume_vm', vmid)
+        except Exception as e:
+            self.logger.error(f"resume_vm {vmid}: {e}")
+            return None
 
     def delete_vm(self, node, vmid, vm_type='qemu', purge=False, destroy_unreferenced=False) -> dict:
         api = self._api()
@@ -1930,13 +1980,15 @@ class XcpngManager:
         """Disable host and optionally evacuate VMs.
         XCP-ng host.disable() prevents new VMs from starting.
         host.evacuate() live-migrates all running VMs away.
+        Returns a MaintenanceTask so the rolling update handler works properly.
         """
+        from pegaprox.models.tasks import MaintenanceTask
         api = self._api()
         if not api:
-            return None  # compat - PegaProxManager returns a MaintenanceTask but we keep it simple
+            return None
 
+        task = MaintenanceTask(node_name)
         try:
-            # find host ref by hostname
             host_ref = None
             for href in api.host.get_all():
                 if api.host.get_hostname(href) == node_name or \
@@ -1945,23 +1997,34 @@ class XcpngManager:
                     break
             if not host_ref:
                 self.logger.error(f"[MAINT] Host {node_name} not found")
+                task.status = 'failed'
+                task.error = f'Host {node_name} not found'
                 return None
 
             api.host.disable(host_ref)
             self.logger.info(f"[MAINT] Host {node_name} disabled")
 
             if not skip_evacuation:
-                # evacuate is async-ish - XAPI handles it
                 try:
                     api.host.evacuate(host_ref)
                     self.logger.info(f"[MAINT] Host {node_name} evacuated")
                 except Exception as ev:
                     self.logger.warning(f"[MAINT] Evacuation of {node_name} failed: {ev}")
+                    task.status = 'completed_with_errors'
+                    task.error = str(ev)
+
+            if task.status not in ('failed', 'completed_with_errors'):
+                task.status = 'completed'
 
             self._cached_nodes = None
-            return {'status': 'completed', 'node': node_name}
+            # NS: store in nodes_in_maintenance so rolling update wait loop sees it
+            with self.maintenance_lock:
+                self.nodes_in_maintenance[node_name] = task
+            return task
         except Exception as e:
             self.logger.error(f"enter_maintenance {node_name}: {e}")
+            task.status = 'failed'
+            task.error = str(e)
             return None
 
     def exit_maintenance_mode(self, node_name):
@@ -1981,14 +2044,18 @@ class XcpngManager:
                 return None
             api.host.enable(host_ref)
             self._cached_nodes = None
+            with self.maintenance_lock:
+                self.nodes_in_maintenance.pop(node_name, None)
             self.logger.info(f"[MAINT] Host {node_name} re-enabled")
             return {'status': 'completed', 'node': node_name}
         except Exception as e:
             self.logger.error(f"exit_maintenance {node_name}: {e}")
             return None
 
-    def get_maintenance_status(self):
-        """Check which hosts are disabled (in maintenance)."""
+    def get_maintenance_status(self, node_name=None):
+        """Check which hosts are disabled (in maintenance).
+        node_name param for API compat - if given, return status for that node only.
+        """
         api = self._api()
         if not api:
             return {}
@@ -2001,6 +2068,8 @@ class XcpngManager:
                     result[hostname] = {'status': 'maintenance', 'node': hostname}
         except Exception:
             pass
+        if node_name:
+            return result.get(node_name, {})
         return result
 
     # ──────────────────────────────────────────
@@ -2121,7 +2190,8 @@ class XcpngManager:
 
                 # HTTP PUT to import endpoint
                 url = f"{host_url}/import_raw_vdi?session_id={session_ref}&vdi={vdi_uuid}&format=raw"
-                resp = _req.put(url, data=file_stream, verify=False,
+                _ssl_verify = getattr(self.config, 'ssl_verification', False)
+                resp = _req.put(url, data=file_stream, verify=_ssl_verify,
                                headers={'Content-Type': 'application/octet-stream'})
                 if resp.status_code in (200, 204):
                     self.logger.info(f"Uploaded {filename} to {storage}")
@@ -2160,7 +2230,8 @@ class XcpngManager:
             p.update(params)
 
         try:
-            resp = _req.get(f"{host_url}/{path}", params=p, verify=False, timeout=15)
+            _ssl_verify = getattr(self.config, 'ssl_verification', False)
+            resp = _req.get(f"{host_url}/{path}", params=p, verify=_ssl_verify, timeout=15)
             if resp.status_code != 200:
                 return None, None
             root = ET.fromstring(resp.text)
@@ -2616,7 +2687,1087 @@ class XcpngManager:
         return gm.get('ip_addresses', [])
 
     # ──────────────────────────────────────────
+    # SSH infrastructure - NS Mar 2026
+    # needed for node config, updates, hardening
+    # ──────────────────────────────────────────
+
+    def _get_host_ip(self, node_name):
+        """Resolve hostname to IP via XAPI host.get_address()."""
+        api = self._api()
+        if not api:
+            return self.config.host
+        try:
+            for href in api.host.get_all():
+                hn = api.host.get_hostname(href)
+                if hn == node_name or api.host.get_name_label(href) == node_name:
+                    return api.host.get_address(href)
+        except Exception:
+            pass
+        return self.config.host
+
+    def _ssh_connect(self, host, retries=3):
+        """Open SSH connection to XCP-ng host."""
+        import paramiko
+
+        ssh_user = self.config.ssh_user or 'root'
+        ssh_port = getattr(self.config, 'ssh_port', 22) or 22
+
+        for attempt in range(retries):
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+                # try key auth first
+                ssh_key = getattr(self.config, 'ssh_key', '')
+                if ssh_key and os.path.isfile(ssh_key):
+                    client.connect(host, port=ssh_port, username=ssh_user,
+                                   key_filename=ssh_key, timeout=15, allow_agent=False)
+                else:
+                    # password from cluster config
+                    client.connect(host, port=ssh_port, username=ssh_user,
+                                   password=self.config.pass_, timeout=15,
+                                   allow_agent=False, look_for_keys=False)
+                return client
+            except Exception as e:
+                if attempt == retries - 1:
+                    self.logger.error(f"SSH to {host} failed: {e}")
+                time.sleep(3)
+        return None
+
+    def _ssh_exec(self, node_name, cmd, timeout=60):
+        """Run command on XCP-ng host via SSH. Returns (exit_code, stdout, stderr)."""
+        host_ip = self._get_host_ip(node_name)
+        ssh = self._ssh_connect(host_ip)
+        if not ssh:
+            return -1, '', 'SSH connection failed'
+        try:
+            _, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+            rc = stdout.channel.recv_exit_status()
+            out = stdout.read().decode('utf-8', errors='replace')
+            err = stderr.read().decode('utf-8', errors='replace')
+            return rc, out, err
+        except Exception as e:
+            return -1, '', str(e)
+        finally:
+            try:
+                ssh.close()
+            except Exception:
+                pass
+
+    # ──────────────────────────────────────────
+    # Node config (DNS, time, hosts) - via SSH
+    # MK Mar 2026 - same interface as Proxmox but SSH-based
+    # ──────────────────────────────────────────
+
+    def get_node_dns(self, node):
+        """Read DNS config from /etc/resolv.conf."""
+        rc, out, _ = self._ssh_exec(node, "cat /etc/resolv.conf 2>/dev/null")
+        if rc != 0:
+            return {}
+        dns_servers = []
+        search_domain = ''
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith('nameserver '):
+                dns_servers.append(line.split(None, 1)[1])
+            elif line.startswith('search '):
+                search_domain = line.split(None, 1)[1]
+        result = {'search': search_domain}
+        for i, srv in enumerate(dns_servers[:3], 1):
+            result[f'dns{i}'] = srv
+        return result
+
+    def update_node_dns(self, node, dns_config):
+        # MK: validate input to prevent shell injection
+        _dns_re = re.compile(r'^[a-zA-Z0-9\.\-:]+$')
+        search = dns_config.get('search', '').strip()
+        if search and not re.match(r'^[a-zA-Z0-9\.\- ]+$', search):
+            return {'success': False, 'error': 'Invalid search domain'}
+        lines = []
+        if search:
+            lines.append(f"search {search}")
+        for key in ['dns1', 'dns2', 'dns3']:
+            val = dns_config.get(key, '').strip()
+            if val:
+                if not _dns_re.match(val):
+                    return {'success': False, 'error': f'Invalid DNS server: {val}'}
+                lines.append(f"nameserver {val}")
+        if not lines:
+            return {'success': False, 'error': 'No DNS servers specified'}
+
+        content = '\n'.join(lines) + '\n'
+        rc, _, err = self._ssh_exec(node,
+            f"cat > /etc/resolv.conf << 'RESOLV_EOF'\n{content}RESOLV_EOF")
+        if rc == 0:
+            return {'success': True, 'message': 'DNS updated'}
+        return {'success': False, 'error': err or 'Failed to write resolv.conf'}
+
+    def get_node_hosts(self, node):
+        """Return /etc/hosts content."""
+        rc, out, _ = self._ssh_exec(node, "cat /etc/hosts 2>/dev/null")
+        return out if rc == 0 else ''
+
+    def update_node_hosts(self, node, hosts_content):
+        if not hosts_content:
+            return {'success': False, 'error': 'Empty hosts content'}
+        # write via heredoc to preserve formatting
+        rc, _, err = self._ssh_exec(node,
+            f"cat > /etc/hosts << 'PEGAPROX_EOF'\n{hosts_content}\nPEGAPROX_EOF")
+        if rc == 0:
+            return {'success': True, 'message': 'Hosts updated'}
+        return {'success': False, 'error': err or 'Failed to write hosts file'}
+
+    def get_node_time(self, node):
+        """Get timezone and current time from node."""
+        rc, out, _ = self._ssh_exec(node,
+            "timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null; echo '---'; date -Iseconds")
+        if rc != 0:
+            return {'timezone': 'UTC'}
+        parts = out.split('---')
+        tz = parts[0].strip().splitlines()[-1] if parts else 'UTC'
+        localtime = parts[1].strip() if len(parts) > 1 else ''
+        return {'timezone': tz, 'localtime': localtime}
+
+    def update_node_time(self, node, timezone):
+        # validate timezone - only allow safe chars (e.g. "Europe/Berlin", "US/Eastern")
+        if not re.match(r'^[a-zA-Z0-9_/\-\+]+$', timezone):
+            return {'success': False, 'error': f'Invalid timezone: {timezone}'}
+        # timedatectl is available on XCP-ng 8.x
+        rc, _, err = self._ssh_exec(node, f"timedatectl set-timezone '{timezone}' 2>&1")
+        if rc == 0:
+            return {'success': True, 'message': 'Timezone updated'}
+        # fallback: symlink (validate path exists)
+        rc2, _, err2 = self._ssh_exec(node,
+            f"test -f /usr/share/zoneinfo/{timezone} && ln -sf /usr/share/zoneinfo/{timezone} /etc/localtime && echo '{timezone}' > /etc/timezone")
+        if rc2 == 0:
+            return {'success': True, 'message': 'Timezone updated (fallback)'}
+        return {'success': False, 'error': err or err2 or 'timedatectl failed'}
+
+    # ──────────────────────────────────────────
+    # Node network config - via XAPI
+    # LW Mar 2026 - XAPI changes are immediate, no apply/revert
+    # ──────────────────────────────────────────
+
+    def _resolve_host_ref(self, node_name):
+        """Find XAPI host ref by hostname or name_label."""
+        api = self._api()
+        if not api:
+            return None, None
+        for href in api.host.get_all():
+            try:
+                if api.host.get_hostname(href) == node_name or \
+                   api.host.get_name_label(href) == node_name:
+                    return api, href
+            except Exception:
+                pass
+        return api, None
+
+    def get_node_network_config(self, node):
+        """Return list of network interfaces with IP config - same shape as Proxmox."""
+        api = self._api()
+        if not api:
+            return []
+        try:
+            interfaces = []
+            for pif_ref in api.PIF.get_all():
+                rec = api.PIF.get_record(pif_ref)
+                host_ref = rec.get('host', 'OpaqueRef:NULL')
+                # filter by node
+                try:
+                    hn = api.host.get_hostname(host_ref)
+                except Exception:
+                    continue
+                if hn != node and api.host.get_name_label(host_ref) != node:
+                    continue
+
+                net_ref = rec.get('network', 'OpaqueRef:NULL')
+                bridge = ''
+                net_name = ''
+                if net_ref != 'OpaqueRef:NULL':
+                    try:
+                        bridge = api.network.get_bridge(net_ref)
+                        net_name = api.network.get_name_label(net_ref)
+                    except Exception:
+                        pass
+
+                vlan_tag = int(rec.get('VLAN', -1))
+                iface_type = 'eth'
+                if vlan_tag >= 0:
+                    iface_type = 'vlan'
+                elif rec.get('bond_slave_of', 'OpaqueRef:NULL') != 'OpaqueRef:NULL':
+                    iface_type = 'bond_slave'
+                elif bridge:
+                    iface_type = 'bridge'
+
+                interfaces.append({
+                    'iface': rec.get('device', ''),
+                    'type': iface_type,
+                    'active': rec.get('currently_attached', False),
+                    'address': rec.get('IP', ''),
+                    'netmask': rec.get('netmask', ''),
+                    'gateway': rec.get('gateway', ''),
+                    'cidr': f"{rec.get('IP', '')}/{rec.get('netmask', '')}" if rec.get('IP') else '',
+                    'bridge': bridge,
+                    'network': net_name,
+                    'method': rec.get('ip_configuration_mode', 'None').lower(),
+                    'families': ['inet'] if rec.get('IP') else [],
+                    'autostart': rec.get('currently_attached', False),
+                    'mac': rec.get('MAC', ''),
+                    'mtu': int(rec.get('MTU', 1500)),
+                    'vlan-id': vlan_tag if vlan_tag >= 0 else None,
+                    'comments': '',
+                    'uuid': rec.get('uuid', ''),
+                })
+            return sorted(interfaces, key=lambda x: x['iface'])
+        except Exception as e:
+            self.logger.error(f"get_node_network_config {node}: {e}")
+            return []
+
+    def create_node_network(self, node, iface, iface_type, config):
+        """Create a new network (bridge) or VLAN on XCP-ng."""
+        api = self._api()
+        if not api:
+            return {'success': False, 'error': 'Not connected'}
+        try:
+            if iface_type == 'vlan':
+                # need the PIF device and VLAN tag
+                vlan_tag = config.get('vlan-id') or config.get('vlan_id')
+                pif_device = config.get('bridge_ports') or config.get('device', iface)
+                if not vlan_tag:
+                    return {'success': False, 'error': 'VLAN tag required'}
+                # find PIF ref
+                pif_ref = None
+                for pr in api.PIF.get_all():
+                    if api.PIF.get_device(pr) == pif_device:
+                        h = api.PIF.get_host(pr)
+                        if api.host.get_hostname(h) == node:
+                            pif_ref = pr
+                            break
+                if not pif_ref:
+                    return {'success': False, 'error': f'PIF {pif_device} not found on {node}'}
+                net_ref = api.network.create({
+                    'name_label': iface,
+                    'name_description': config.get('comments', f'VLAN {vlan_tag}'),
+                    'other_config': {},
+                })
+                api.VLAN.create(pif_ref, str(vlan_tag), net_ref)
+            else:
+                # create a bridge/internal network
+                net_ref = api.network.create({
+                    'name_label': iface,
+                    'name_description': config.get('comments', ''),
+                    'other_config': {},
+                })
+                # NS: if IP config provided, need to assign via PIF
+                # but new internal networks don't have a PIF automatically
+
+            self._cached_nodes = None
+            self.logger.info(f"Created network {iface} ({iface_type}) on {node}")
+            return {'success': True, 'message': f'Interface {iface} created'}
+        except Exception as e:
+            self.logger.error(f"create_node_network: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def update_node_network(self, node, iface, config):
+        """Update PIF IP config via XAPI reconfigure_ip."""
+        api = self._api()
+        if not api:
+            return {'success': False, 'error': 'Not connected'}
+        try:
+            # find PIF for this device on node
+            target_pif = None
+            for pr in api.PIF.get_all():
+                rec = api.PIF.get_record(pr)
+                if rec.get('device') != iface:
+                    continue
+                h = rec.get('host', 'OpaqueRef:NULL')
+                try:
+                    if api.host.get_hostname(h) == node or api.host.get_name_label(h) == node:
+                        target_pif = pr
+                        break
+                except Exception:
+                    pass
+            if not target_pif:
+                return {'success': False, 'error': f'Interface {iface} not found on {node}'}
+
+            mode = config.get('method', config.get('ip_configuration_mode', 'DHCP')).upper()
+            if mode not in ('DHCP', 'STATIC', 'NONE'):
+                mode = 'DHCP'
+
+            if mode == 'STATIC':
+                ip = config.get('address', '')
+                mask = config.get('netmask', '255.255.255.0')
+                gw = config.get('gateway', '')
+                dns = config.get('dns', '')
+                api.PIF.reconfigure_ip(target_pif, 'Static', ip, mask, gw, dns)
+            elif mode == 'DHCP':
+                api.PIF.reconfigure_ip(target_pif, 'DHCP', '', '', '', '')
+            else:
+                api.PIF.reconfigure_ip(target_pif, 'None', '', '', '', '')
+
+            self._cached_nodes = None
+            return {'success': True, 'message': 'Network updated'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def delete_node_network(self, node, iface):
+        """Delete a network. Only user-created networks can be removed."""
+        api = self._api()
+        if not api:
+            return {'success': False, 'error': 'Not connected'}
+        try:
+            # find by name_label
+            nets = api.network.get_by_name_label(iface)
+            if not nets:
+                return {'success': False, 'error': f'Network {iface} not found'}
+            # check no VIFs attached
+            vifs = api.network.get_VIFs(nets[0])
+            if vifs:
+                return {'success': False, 'error': f'Network {iface} has {len(vifs)} VIF(s) attached, remove them first'}
+            # check not management network
+            pifs = api.network.get_PIFs(nets[0])
+            for pr in pifs:
+                if api.PIF.get_management(pr):
+                    return {'success': False, 'error': 'Cannot delete management network'}
+            # destroy associated VLANs
+            for pr in pifs:
+                vlan_ref = api.PIF.get_VLAN_master_of(pr)
+                if vlan_ref != 'OpaqueRef:NULL':
+                    api.VLAN.destroy(vlan_ref)
+            api.network.destroy(nets[0])
+            self.logger.info(f"Deleted network {iface}")
+            return {'success': True, 'message': f'Interface {iface} deleted'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def apply_node_network(self, node):
+        """No-op - XAPI network changes are immediate."""
+        return {'success': True, 'message': 'Network changes applied (XCP-ng applies immediately)'}
+
+    def revert_node_network(self, node):
+        """No-op - XAPI doesn't have pending network changes."""
+        return {'success': True, 'message': 'Nothing to revert (XCP-ng applies changes immediately)'}
+
+    def get_cluster_networks(self):
+        """Cluster-wide network overview with VM assignments."""
+        api = self._api()
+        if not api:
+            return []
+        try:
+            result = []
+            for net_ref in api.network.get_all():
+                rec = api.network.get_record(net_ref)
+                if rec.get('name_label', '').startswith('xapi'):
+                    continue
+                vif_count = len(rec.get('VIFs', []))
+                pif_count = len(rec.get('PIFs', []))
+                result.append({
+                    'name': rec.get('name_label', ''),
+                    'bridge': rec.get('bridge', ''),
+                    'uuid': rec.get('uuid', ''),
+                    'vif_count': vif_count,
+                    'pif_count': pif_count,
+                    'mtu': int(rec.get('MTU', 1500)),
+                })
+            return result
+        except Exception as e:
+            self.logger.error(f"get_cluster_networks: {e}")
+            return []
+
+    # ──────────────────────────────────────────
+    # Node reboot / shutdown - XAPI calls
+    # ──────────────────────────────────────────
+
+    def reboot_node(self, node_name):
+        api, href = self._resolve_host_ref(node_name)
+        if not href:
+            return {'success': False, 'error': f'Host {node_name} not found'}
+        try:
+            api.host.disable(href)
+            api.Async.host.reboot(href)
+            self._cached_nodes = None
+            self.logger.info(f"Rebooting host {node_name}")
+            return {'success': True, 'message': f'{node_name} rebooting'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def shutdown_node(self, node_name):
+        api, href = self._resolve_host_ref(node_name)
+        if not href:
+            return {'success': False, 'error': f'Host {node_name} not found'}
+        try:
+            api.host.disable(href)
+            api.Async.host.shutdown(href)
+            self._cached_nodes = None
+            self.logger.info(f"Shutting down host {node_name}")
+            return {'success': True, 'message': f'{node_name} shutting down'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    # ──────────────────────────────────────────
+    # Node updates - yum-based (XCP-ng is CentOS/RHEL)
+    # NS/MK Mar 2026
+    # ──────────────────────────────────────────
+
+    def start_node_update(self, node_name, reboot=True, force=False):
+        """Start async yum update on XCP-ng node."""
+        from pegaprox.models.tasks import UpdateTask
+
+        if not force and node_name in self.nodes_in_maintenance:
+            return None
+
+        with self.update_lock:
+            if node_name in self.nodes_updating:
+                existing = self.nodes_updating[node_name]
+                if existing.status not in ('completed', 'failed'):
+                    return existing  # already running
+
+        task = UpdateTask(node_name, reboot)
+        with self.update_lock:
+            self.nodes_updating[node_name] = task
+
+        t = threading.Thread(target=self._perform_node_update, daemon=True,
+                             args=(node_name, task))
+        t.start()
+        return task
+
+    def _perform_node_update(self, node_name, task):
+        """Background: run yum update via SSH."""
+        task.status = 'updating'
+        task.phase = 'yum_update'
+        task.add_output(f"Starting update on {node_name}...")
+
+        host_ip = self._get_host_ip(node_name)
+        ssh = self._ssh_connect(host_ip)
+        if not ssh:
+            task.status = 'failed'
+            task.error = f'SSH connection to {node_name} failed'
+            task.add_output(task.error)
+            return
+
+        try:
+            # phase 1: yum clean + update
+            task.add_output("Running yum clean all...")
+            _, stdout, stderr = ssh.exec_command("yum clean all 2>&1", timeout=60)
+            stdout.channel.recv_exit_status()
+
+            task.phase = 'yum_upgrade'
+            task.add_output("Running yum update -y ...")
+            _, stdout, stderr = ssh.exec_command("yum update -y 2>&1", timeout=600)
+            rc = stdout.channel.recv_exit_status()
+            output = stdout.read().decode('utf-8', errors='replace')
+
+            pkg_count = 0
+            for line in output.splitlines():
+                task.add_output(line)
+                if 'Updated:' in line or 'Installed:' in line:
+                    pkg_count += 1
+            task.packages_upgraded = pkg_count
+
+            if rc not in (0, 100):  # yum returns 100 when there are updates
+                task.status = 'failed'
+                task.error = f'yum update exited with code {rc}'
+                task.add_output(f"ERROR: {task.error}")
+                return
+
+            # phase 2: reboot if requested
+            if task.reboot:
+                task.phase = 'reboot'
+                task.status = 'rebooting'
+                task.add_output(f"Rebooting {node_name}...")
+                ssh.exec_command("reboot", timeout=5)
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+                ssh = None
+
+                # wait for node
+                task.phase = 'wait_online'
+                task.status = 'waiting_online'
+                task.add_output("Waiting for node to come back online...")
+                online = self._wait_for_host_online(node_name, timeout=300)
+                if online:
+                    task.add_output(f"{node_name} is back online")
+                else:
+                    task.add_output(f"WARNING: {node_name} did not come back within timeout")
+
+            task.status = 'completed'
+            task.phase = 'done'
+            from datetime import datetime
+            task.completed_at = datetime.now()
+            task.add_output("Update completed successfully")
+        except Exception as e:
+            task.status = 'failed'
+            task.error = str(e)
+            task.add_output(f"ERROR: {e}")
+        finally:
+            if ssh:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+
+    def _wait_for_host_online(self, node_name, timeout=300):
+        """Wait for XCP-ng host to come back after reboot by polling XAPI."""
+        import socket
+        host_ip = self._get_host_ip(node_name)
+        time.sleep(20)  # give it time to shut down
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                sock = socket.create_connection((host_ip, 443), timeout=5)
+                sock.close()
+                # brief pause then verify XAPI responds
+                time.sleep(5)
+                api = self._api()
+                if api:
+                    self._cached_nodes = None
+                    return True
+            except Exception:
+                pass
+            time.sleep(10)
+        return False
+
+    def get_update_status(self, node_name):
+        with self.update_lock:
+            if node_name in self.nodes_updating:
+                return self.nodes_updating[node_name].to_dict()
+        return None
+
+    def clear_update_status(self, node_name):
+        with self.update_lock:
+            if node_name in self.nodes_updating:
+                t = self.nodes_updating[node_name]
+                if t.status in ('completed', 'failed'):
+                    del self.nodes_updating[node_name]
+                    return True
+        return False
+
+    def get_node_apt_updates(self, node):
+        """List pending updates - yum equivalent of apt updates.
+        Returns same field names as Proxmox APT so the frontend renders correctly."""
+        rc, out, _ = self._ssh_exec(node, "yum check-update 2>/dev/null", timeout=120)
+        # yum check-update returns 100 if updates available, 0 if none
+        if rc not in (0, 100):
+            return []
+        pending = []
+        past_header = False
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                past_header = True
+                continue
+            if not past_header:
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                pending.append((parts[0], parts[1], parts[2]))
+
+        if not pending:
+            return []
+
+        # batch query installed versions in one SSH call
+        pkg_names = [p[0].rsplit('.', 1)[0] if '.' in p[0] else p[0] for p in pending]
+        installed = {}
+        try:
+            # NS: one rpm call for all packages, pipe-separated output
+            cmd = "rpm -q --qf '%{NAME}\\t%{VERSION}-%{RELEASE}\\n' " + ' '.join(pkg_names) + " 2>/dev/null"
+            rc2, rpm_out, _ = self._ssh_exec(node, cmd, timeout=30)
+            if rc2 == 0:
+                for rline in rpm_out.splitlines():
+                    rparts = rline.split('\t', 1)
+                    if len(rparts) == 2:
+                        installed[rparts[0]] = rparts[1]
+        except Exception:
+            pass
+
+        updates = []
+        for pkg_full, new_ver, repo in pending:
+            pkg_name = pkg_full.rsplit('.', 1)[0] if '.' in pkg_full else pkg_full
+            updates.append({
+                'Package': pkg_name,
+                'OldVersion': installed.get(pkg_name, ''),
+                'Version': new_ver,
+                'Origin': repo,
+                'Section': 'security' if 'security' in repo.lower() else 'updates',
+            })
+        return updates
+
+    def refresh_node_apt(self, node):
+        """Refresh package cache - yum clean metadata."""
+        rc, _, err = self._ssh_exec(node, "yum clean metadata 2>&1 && yum makecache fast 2>&1", timeout=120)
+        if rc == 0:
+            return {'success': True, 'task': None}
+        return {'success': False, 'error': err or 'yum makecache failed'}
+
+    # ──────────────────────────────────────────
+    # CVE scanner - yum-based
+    # NS Mar 2026 - same output shape as Proxmox (debsecan → yum-plugin-security)
+    # ──────────────────────────────────────────
+
+    def scan_node_packages(self, node_name):
+        """Scan XCP-ng node for CVEs and pending updates."""
+        cmd = """
+echo '---OS---'
+cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '"'
+echo '---KERNEL---'
+uname -r
+echo '---XE---'
+xe host-list params=software-version 2>/dev/null | head -5 || echo 'N/A'
+echo '---REBOOT---'
+if [ -f /var/run/reboot-required ] || needs-restarting -r 2>/dev/null; then echo 'YES'; else echo 'NO'; fi
+echo '---CVES---'
+yum updateinfo list cves 2>/dev/null || echo 'UNAVAILABLE'
+echo '---UPDATES---'
+yum check-update 2>/dev/null
+echo '---END---'
+"""
+        rc, out, _ = self._ssh_exec(node_name, cmd.strip(), timeout=120)
+        from datetime import datetime
+        result = {
+            'node': node_name,
+            'timestamp': datetime.now().isoformat(),
+            'os': '', 'kernel': '', 'pve_version': '',
+            'reboot_required': False,
+            'debsecan_available': False,
+            'cves': [], 'packages': [],
+            'cve_count': 0, 'security_count': 0, 'total_count': 0,
+        }
+        if rc == -1:
+            result['error'] = 'SSH connection failed'
+            return result
+
+        section = None
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('---') and stripped.endswith('---'):
+                section = stripped.strip('-')
+                continue
+            if section == 'OS' and stripped:
+                result['os'] = stripped
+            elif section == 'KERNEL' and stripped:
+                result['kernel'] = stripped
+            elif section == 'XE' and stripped and stripped != 'N/A':
+                result['pve_version'] = stripped  # reusing field name for compat
+            elif section == 'REBOOT':
+                if 'YES' in stripped.upper():
+                    result['reboot_required'] = True
+            elif section == 'CVES':
+                if stripped == 'UNAVAILABLE':
+                    continue
+                result['debsecan_available'] = True
+                # format: CVE-XXXX-YYYY severity package
+                parts = stripped.split()
+                if len(parts) >= 3 and parts[0].startswith('CVE-'):
+                    result['cves'].append({
+                        'cve': parts[0],
+                        'package': parts[-1],
+                        'urgency': parts[1].lower() if len(parts) > 2 else 'unknown',
+                        'status': 'fixed available',
+                    })
+            elif section == 'UPDATES':
+                parts = stripped.split()
+                if len(parts) >= 3 and not stripped.startswith('Last') and not stripped.startswith('Loaded'):
+                    is_security = 'security' in parts[2].lower() if len(parts) > 2 else False
+                    result['packages'].append({
+                        'name': parts[0],
+                        'current': '',
+                        'available': parts[1],
+                        'source': parts[2] if len(parts) > 2 else '',
+                        'security': is_security,
+                        'severity': 'security' if is_security else 'normal',
+                    })
+
+        result['cve_count'] = len(result['cves'])
+        result['security_count'] = sum(1 for p in result['packages'] if p.get('security'))
+        result['total_count'] = len(result['packages'])
+        return result
+
+    # ──────────────────────────────────────────
+    # CIS Hardening - SSH-based checks
+    # MK Mar 2026 - adapted for XCP-ng (CentOS 7.x base)
+    # ──────────────────────────────────────────
+
+    # controls mapped to XCP-ng/CentOS equivalents
+    _CIS_CHECKS = {
+        'fs_modules': {
+            'check': "[ -f /etc/modprobe.d/cis-disable-modules.conf ] && echo OK || echo FAIL",
+            'apply': """cat > /etc/modprobe.d/cis-disable-modules.conf << 'MODEOF'
+install cramfs /bin/false
+blacklist cramfs
+install freevxfs /bin/false
+blacklist freevxfs
+install hfs /bin/false
+blacklist hfs
+install hfsplus /bin/false
+blacklist hfsplus
+install jffs2 /bin/false
+blacklist jffs2
+install dccp /bin/false
+blacklist dccp
+install sctp /bin/false
+blacklist sctp
+install rds /bin/false
+blacklist rds
+install tipc /bin/false
+blacklist tipc
+MODEOF
+echo DONE""",
+        },
+        'core_dumps': {
+            'check': """[ -f /etc/systemd/coredump.conf.d/disable-coredump.conf ] && \
+grep -q 'hard core 0' /etc/security/limits.conf 2>/dev/null && echo OK || echo FAIL""",
+            'apply': """mkdir -p /etc/systemd/coredump.conf.d
+cat > /etc/systemd/coredump.conf.d/disable-coredump.conf << 'CDEOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+CDEOF
+grep -q 'hard core 0' /etc/security/limits.conf 2>/dev/null || echo '* hard core 0' >> /etc/security/limits.conf
+echo DONE""",
+        },
+        'ssh_perms': {
+            'check': "stat -c '%a' /etc/ssh/sshd_config 2>/dev/null | grep -q '600' && echo OK || echo FAIL",
+            'apply': """chmod 600 /etc/ssh/sshd_config
+chown root:root /etc/ssh/sshd_config
+chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null
+chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null
+echo DONE""",
+        },
+        'ssh_crypto': {
+            'check': "grep -q 'CIS SSH Cryptographic Hardening' /etc/ssh/sshd_config 2>/dev/null && echo OK || echo FAIL",
+            'apply': """cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.cis
+sed -i -e '/^Ciphers /d' -e '/^KexAlgorithms /d' -e '/^MACs /d' \
+  -e '/^GSSAPIAuthentication /d' -e '/^HostbasedAuthentication /d' \
+  -e '/^IgnoreRhosts /d' /etc/ssh/sshd_config
+cat >> /etc/ssh/sshd_config << 'SSHEOF'
+
+# CIS SSH Cryptographic Hardening - applied by PegaProx
+Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+GSSAPIAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
+SSHEOF
+sshd -t 2>/dev/null && systemctl restart sshd || { cp /etc/ssh/sshd_config.bak.cis /etc/ssh/sshd_config; systemctl restart sshd; }
+echo DONE""",
+        },
+        'shell_timeout': {
+            'check': "grep -q 'TMOUT=900' /etc/profile.d/cis-timeout.sh 2>/dev/null && echo OK || echo FAIL",
+            'apply': """cat > /etc/profile.d/cis-timeout.sh << 'TMEOF'
+TMOUT=900
+readonly TMOUT
+export TMOUT
+TMEOF
+chmod 644 /etc/profile.d/cis-timeout.sh
+echo DONE""",
+        },
+        'file_perms': {
+            'check': "stat -c '%a' /etc/passwd 2>/dev/null | grep -q '644' && stat -c '%a' /etc/shadow 2>/dev/null | grep -qE '(640|600)' && echo OK || echo FAIL",
+            'apply': """chmod 644 /etc/passwd /etc/group
+chmod 640 /etc/shadow /etc/gshadow 2>/dev/null
+chown root:root /etc/passwd /etc/group
+chown root:shadow /etc/shadow 2>/dev/null
+echo DONE""",
+        },
+        'journald': {
+            'check': "[ -f /etc/systemd/journald.conf.d/99-cis-hardening.conf ] && echo OK || echo FAIL",
+            'apply': """mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-cis-hardening.conf << 'JDEOF'
+[Journal]
+Storage=persistent
+Compress=yes
+ForwardToSyslog=no
+JDEOF
+systemctl restart systemd-journald
+echo DONE""",
+        },
+        'pw_aging': {
+            'check': "grep -q 'PASS_MAX_DAYS.*365' /etc/login.defs && echo OK || echo FAIL",
+            'apply': """sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   365/' /etc/login.defs
+sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   1/' /etc/login.defs
+sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE   30/' /etc/login.defs
+chage -M -1 root 2>/dev/null
+chage -m 0 root 2>/dev/null
+echo DONE""",
+        },
+        'default_umask': {
+            'check': "(grep -q 'UMASK.*027' /etc/login.defs 2>/dev/null || grep -q 'umask 027' /etc/profile 2>/dev/null) && echo OK || echo FAIL",
+            'apply': """if grep -q '^UMASK' /etc/login.defs 2>/dev/null; then
+  sed -i 's/^UMASK.*/UMASK           027/' /etc/login.defs
+else
+  echo 'UMASK           027' >> /etc/login.defs
+fi
+grep -q '^umask 027' /etc/profile || echo 'umask 027' >> /etc/profile
+echo DONE""",
+        },
+        'firewall': {
+            'check': "systemctl is-active iptables 2>/dev/null | grep -q active && echo OK || systemctl is-active firewalld 2>/dev/null | grep -q active && echo OK || echo FAIL",
+            'apply': "echo 'Manual: enable iptables or firewalld and configure rules'; echo DONE",
+        },
+    }
+
+    def check_node_hardening(self, node_name):
+        """Run CIS checks on XCP-ng host and return status per control."""
+        parts = []
+        for cid, spec in self._CIS_CHECKS.items():
+            parts.append(f"echo '---{cid}---'")
+            parts.append(spec['check'])
+        cmd = '; '.join(parts)
+
+        rc, out, _ = self._ssh_exec(node_name, cmd, timeout=60)
+        if rc == -1:
+            return None
+
+        results = {}
+        current_id = None
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('---') and stripped.endswith('---'):
+                current_id = stripped.strip('-')
+                continue
+            if current_id and stripped in ('OK', 'FAIL'):
+                results[current_id] = (stripped == 'OK')
+        return results
+
+    def apply_node_hardening(self, node_name, controls):
+        """Apply selected CIS controls via SSH."""
+        results = {}
+        for cid in controls:
+            spec = self._CIS_CHECKS.get(cid)
+            if not spec:
+                results[cid] = {'success': False, 'error': f'Unknown control: {cid}'}
+                continue
+            rc, out, _ = self._ssh_exec(node_name, spec['apply'], timeout=60)
+            if 'DONE' in out:
+                results[cid] = {'success': True}
+                self.logger.info(f"[CIS] Applied {cid} on {node_name}")
+            else:
+                results[cid] = {'success': False, 'error': out.strip()[-200:] if out else 'No output'}
+        return results
+
+    # ──────────────────────────────────────────
+    # Resource pools - DB-backed (XAPI has no equivalent)
+    # LW Mar 2026 - lightweight pool feature for XCP-ng
+    # ──────────────────────────────────────────
+
+    def get_pools(self):
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('SELECT poolid, comment FROM xcpng_pools WHERE cluster_id = ?', (self.id,))
+        return [{'poolid': r[0], 'comment': r[1] or ''} for r in cursor.fetchall()]
+
+    def get_pool_members(self, pool_id):
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('SELECT vmid FROM xcpng_pool_members WHERE cluster_id = ? AND poolid = ?',
+                       (self.id, pool_id))
+        vmids = [r[0] for r in cursor.fetchall()]
+        members = []
+        for vmid in vmids:
+            # find VM in cache for name
+            vm = next((v for v in (self._cached_vms or []) if v.get('vmid') == vmid), None)
+            members.append({
+                'vmid': vmid,
+                'type': 'qemu',
+                'name': vm.get('name', '') if vm else '',
+                'status': vm.get('status', '') if vm else '',
+            })
+        return {'poolid': pool_id, 'members': members}
+
+    def get_vm_pool(self, vmid, vm_type='qemu'):
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute('SELECT poolid FROM xcpng_pool_members WHERE cluster_id = ? AND vmid = ?',
+                       (self.id, int(vmid)))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def create_pool(self, poolid, comment=''):
+        db = get_db()
+        try:
+            cursor = db.conn.cursor()
+            cursor.execute('INSERT INTO xcpng_pools (cluster_id, poolid, comment) VALUES (?, ?, ?)',
+                           (self.id, poolid, comment))
+            db.conn.commit()
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def update_pool(self, poolid, comment='', members_to_add=None, members_to_remove=None):
+        db = get_db()
+        cursor = db.conn.cursor()
+        try:
+            if comment is not None:
+                cursor.execute('UPDATE xcpng_pools SET comment = ? WHERE cluster_id = ? AND poolid = ?',
+                               (comment, self.id, poolid))
+            if members_to_add:
+                for vmid in members_to_add:
+                    cursor.execute('INSERT OR IGNORE INTO xcpng_pool_members (cluster_id, poolid, vmid) VALUES (?, ?, ?)',
+                                   (self.id, poolid, int(vmid)))
+            if members_to_remove:
+                for vmid in members_to_remove:
+                    cursor.execute('DELETE FROM xcpng_pool_members WHERE cluster_id = ? AND poolid = ? AND vmid = ?',
+                                   (self.id, poolid, int(vmid)))
+            db.conn.commit()
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def delete_pool(self, poolid):
+        db = get_db()
+        try:
+            cursor = db.conn.cursor()
+            # check for members
+            cursor.execute('SELECT COUNT(*) FROM xcpng_pool_members WHERE cluster_id = ? AND poolid = ?',
+                           (self.id, poolid))
+            cnt = cursor.fetchone()[0]
+            if cnt > 0:
+                return {'success': False, 'error': f'Pool not empty - contains {cnt} members'}
+            cursor.execute('DELETE FROM xcpng_pools WHERE cluster_id = ? AND poolid = ?', (self.id, poolid))
+            db.conn.commit()
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    # ──────────────────────────────────────────
+    # Cross-pool migration - XAPI VM.migrate_send
+    # NS Mar 2026 - requires network connectivity between pools
+    # ──────────────────────────────────────────
+
+    def remote_migrate_vm(self, node, vmid, vm_type='qemu', target_endpoint=None,
+                          target_storage=None, target_bridge=None, target_vmid=None,
+                          online=True, delete_source=True, bwlimit=None):
+        """Migrate VM to another XCP-ng pool via XAPI migrate_send.
+
+        target_endpoint: https://<remote_host> of the target pool master
+        """
+        if not target_endpoint:
+            return {'success': False, 'error': 'Target endpoint required'}
+
+        api = self._api()
+        if not api:
+            return {'success': False, 'error': 'Not connected'}
+
+        try:
+            vm_ref = self._resolve_vm(vmid)
+            power = api.VM.get_power_state(vm_ref)
+
+            # connect to remote pool to get session
+            remote_session = XenAPI.Session(target_endpoint, ignore_ssl=True)
+            remote_session.xenapi.login_with_password(
+                self.config.user, self.config.pass_, '1.0', 'PegaProx')
+
+            # build migrate_send params
+            dest = {
+                'force': 'true',
+            }
+            # add session ref for auth
+            dest['session_id'] = remote_session._session
+
+            # live or offline?
+            live = online and power == 'Running'
+
+            if live:
+                # live migrate across pools
+                # NS: XAPI wants a dict with destination host/network info
+                dest_host_refs = remote_session.xenapi.host.get_all()
+                if not dest_host_refs:
+                    return {'success': False, 'error': 'No hosts in target pool'}
+                dest['host'] = dest_host_refs[0]  # pool master
+                # vdi_map and vif_map can be empty for default mapping
+                task_ref = api.Async.VM.migrate_send(vm_ref, dest, live, {}, {}, {})
+            else:
+                if power != 'Halted':
+                    api.VM.hard_shutdown(vm_ref)
+                    time.sleep(3)
+                # for offline, use VM.copy to remote SR
+                # this is more like clone+transfer
+                task_ref = api.Async.VM.copy(vm_ref, f'migrated-{vmid}', 'OpaqueRef:NULL')
+
+            task_id = self._track_task(task_ref, 'remote_migrate', vmid)
+
+            try:
+                remote_session.xenapi.session.logout()
+            except Exception:
+                pass
+
+            self.logger.info(f"Remote migration started: VM {vmid} -> {target_endpoint}")
+            return {'success': True, 'task': task_id}
+        except Exception as e:
+            self.logger.error(f"remote_migrate_vm {vmid}: {e}")
+            return {'success': False, 'error': str(e)}
+
+    # ──────────────────────────────────────────
+    # Additional node info stubs
+    # ──────────────────────────────────────────
+
+    def get_node_summary(self, node):
+        """Node summary - same as get_node_details but flatter."""
+        return self.get_node_details(node)
+
+    def get_node_syslog(self, node, start=0, limit=500):
+        """Fetch recent syslog entries via SSH."""
+        rc, out, _ = self._ssh_exec(node,
+            f"journalctl --no-pager -n {limit} --output=short-iso 2>/dev/null || tail -n {limit} /var/log/messages 2>/dev/null",
+            timeout=15)
+        if rc != 0 or not out:
+            return []
+        lines = out.strip().splitlines()
+        return [{'n': i + start, 't': line} for i, line in enumerate(lines)]
+
+    def get_node_certificates(self, node):
+        """Read xapi-ssl.pem certificate info."""
+        rc, out, _ = self._ssh_exec(node,
+            "openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -subject -enddate -issuer 2>/dev/null")
+        if rc != 0:
+            return []
+        info = {}
+        for line in out.splitlines():
+            if '=' in line:
+                k, v = line.split('=', 1)
+                info[k.strip().lower()] = v.strip()
+        return [{
+            'filename': 'xapi-ssl.pem',
+            'subject': info.get('subject', ''),
+            'issuer': info.get('issuer', ''),
+            'notafter': info.get('notafter', ''),
+            'fingerprint': '',
+            'san': [],
+        }]
+
+    def renew_node_certificate(self, node, force=False):
+        return {'success': False, 'error': 'Certificate renewal not supported for XCP-ng via web UI'}
+
+    def upload_node_certificate(self, node, certificates, key, restart=True, force=False):
+        return {'success': False, 'error': 'Custom certificate upload not yet supported for XCP-ng'}
+
+    def delete_node_certificate(self, node, restart=True):
+        return {'success': False, 'error': 'Certificate management not supported for XCP-ng via web UI'}
+
+    def get_node_subscription(self, node):
+        return {}
+
+    def update_node_subscription(self, node, key):
+        return {'success': False, 'error': 'Subscription management not applicable for XCP-ng'}
+
+    def get_node_replication(self, node):
+        return []
+
+    def get_node_tasks(self, node, start=0, limit=50, errors=False):
+        """Return tasks filtered by node."""
+        tasks = self.get_tasks(limit=limit)
+        return tasks  # all tasks are pool-wide anyway
+
+    def get_node_task_log(self, node, upid, start=0, limit=50):
+        return self.get_task_log(node, upid, limit)
+
+    # ──────────────────────────────────────────
     # Proxmox-specific stubs (no-ops for XCP-ng)
+    # NS: these exist so the API layer doesn't crash on XCP-ng clusters
     # ──────────────────────────────────────────
 
     def _create_session(self):
@@ -2626,13 +3777,54 @@ class XcpngManager:
     def get_last_migration_log(self):
         return []
 
-    def get_pools(self):
-        """XCP-ng pools are the cluster itself - return empty for Proxmox pool compat."""
-        return []
+    # NS: get_pools / get_pool_members moved to resource pools section above (DB-backed)
 
-    def get_pool_members(self, pool_id):
-        """Proxmox resource pools don't exist in XCP-ng."""
-        return {'members': []}
+    def get_next_vmid(self) -> dict:
+        """Return next available VMID from our xcpng_vmid_map sequence."""
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute('SELECT MAX(vmid) FROM xcpng_vmid_map WHERE cluster_id = ?', (self.id,))
+            row = cursor.fetchone()
+            next_id = (row[0] or 99) + 1
+            return {'success': True, 'vmid': next_id}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def get_node_shell_ticket(self, node):
+        """XCP-ng doesn't support browser shell - use SSH directly."""
+        return {'success': False, 'error': 'Shell access not supported for XCP-ng. Use SSH to connect to the host.'}
+
+    def get_vm_lock_status(self, node, vmid, vm_type='qemu'):
+        """XCP-ng VMs use XAPI locks internally, not user-visible like Proxmox."""
+        try:
+            ref = self._resolve_vm(vmid)
+            api = self._api()
+            if not api:
+                return {'success': False, 'error': 'Not connected'}
+            ops = api.VM.get_current_operations(ref)
+            if ops:
+                return {'success': True, 'locked': True, 'lock_reason': 'operation',
+                        'lock_description': f'Active operations: {", ".join(ops.values())}'}
+            return {'success': True, 'locked': False, 'lock_reason': None, 'lock_description': None}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def unlock_vm(self, node, vmid, vm_type='qemu'):
+        """Cancel pending operations on XCP-ng VM. Not a direct equivalent to Proxmox unlock."""
+        try:
+            ref = self._resolve_vm(vmid)
+            api = self._api()
+            if not api:
+                return {'success': False, 'error': 'Not connected'}
+            ops = api.VM.get_current_operations(ref)
+            if not ops:
+                return {'success': True, 'message': 'VM has no active operations', 'was_locked': False}
+            # can't really cancel XAPI ops the same way, but report the state
+            return {'success': True, 'message': 'XCP-ng operations are managed by XAPI', 'was_locked': bool(ops),
+                    'lock_reason': ', '.join(ops.values()) if ops else None}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
 
     def get_iso_list(self, node, storage=None):
         """List ISOs on ISO-type SRs."""
@@ -2660,6 +3852,134 @@ class XcpngManager:
         except Exception as e:
             self.logger.error(f"get_iso_list: {e}")
             return []
+
+    # ──────────────────────────────────────────
+    # Proxmox-only stubs - prevent AttributeError on XCP-ng clusters
+    # These are called by the API/background layers without type checks
+    # ──────────────────────────────────────────
+
+    def sanitize_boot_order(self, node, vmid, vm_type='qemu'):
+        pass  # Proxmox-specific, XCP-ng handles boot order differently
+
+    def update_node_options(self, node, options):
+        return {'success': False, 'error': 'Node options not supported on XCP-ng'}
+
+    def get_storage_list(self, node=None):
+        """Alias for get_storages - Proxmox API compat."""
+        return self.get_storages(node)
+
+    def get_network_list(self, node=None):
+        return self.get_networks(node)
+
+    def toggle_network_link(self, node, vmid, vm_type, net_id, state):
+        return {'success': False, 'error': 'Not supported on XCP-ng'}
+
+    def check_snapshot_capability(self, node, vmid, vm_type='qemu'):
+        return {'capable': True, 'reason': ''}
+
+    # efficient snapshots - Proxmox LVM feature, not applicable to XCP-ng
+    def get_efficient_snapshots(self, cluster_id, vmid, refresh_usage=False):
+        return []
+
+    def create_efficient_snapshot(self, node, vmid, vm_type, snapname, description='', snap_size_gb=0):
+        return {'success': False, 'error': 'Efficient snapshots are a Proxmox-only feature. Use standard snapshots.'}
+
+    def delete_efficient_snapshot(self, node, vmid, snap_id):
+        return {'success': False, 'error': 'Efficient snapshots not available on XCP-ng'}
+
+    def rollback_efficient_snapshot(self, node, vmid, vm_type, snap_id):
+        return {'success': False, 'error': 'Efficient snapshots not available on XCP-ng'}
+
+    # replication - Proxmox ZFS feature
+    def get_replication_jobs(self, node=None):
+        return []
+
+    def create_replication_job(self, node, vmid, target, schedule='*/15', rate=None, comment=''):
+        return {'success': False, 'error': 'Replication jobs are a Proxmox ZFS feature'}
+
+    def delete_replication_job(self, job_id):
+        return {'success': False, 'error': 'No replication jobs on XCP-ng'}
+
+    def run_replication_now(self, job_id):
+        return {'success': False, 'error': 'No replication jobs on XCP-ng'}
+
+    # hardware option lists for VM create wizard
+    def get_cpu_types(self):
+        return ['host', 'max']  # XCP-ng uses host passthrough by default
+
+    def get_scsi_controllers(self):
+        return []  # XCP-ng uses PV drivers, no SCSI controller selection
+
+    def get_network_models(self):
+        return ['e1000', 'rtl8139', 'netfront']
+
+    def get_disk_bus_types(self):
+        return ['xvd', 'hd']  # Xen virtual block devices
+
+    def get_cache_modes(self):
+        return ['none', 'writethrough', 'writeback']
+
+    def get_machine_types(self):
+        return ['hvm', 'pv']  # Xen HVM or paravirtualized
+
+    # HA stubs - XCP-ng has pool HA but different interface
+    def start_ha_monitor(self):
+        pass  # XCP-ng HA is managed by XAPI, no separate monitor needed
+
+    def stop_ha_monitor(self):
+        pass
+
+    def add_vm_to_proxmox_ha(self, node, vmid, vm_type='qemu', group=None, max_restart=1, max_relocate=1):
+        """Use set_vm_ha_restart_priority instead for XCP-ng."""
+        return self.set_vm_ha_restart_priority(vmid, 'restart')
+
+    def remove_vm_from_proxmox_ha(self, node, vmid, vm_type='qemu'):
+        return self.set_vm_ha_restart_priority(vmid, '')
+
+    # balancing
+    def set_vm_balancing_excluded(self, vmid, excluded, vm_type='qemu'):
+        return {'success': False, 'error': 'VM balancing exclusion not implemented for XCP-ng'}
+
+    def find_migration_candidate(self, *args, **kwargs):
+        return None
+
+    # scheduler compat
+    def restart_vm(self, node, vmid, vm_type='qemu'):
+        return self.reboot_vm(node, vmid)
+
+    def backup_vm(self, node, vmid, vm_type='qemu', **kwargs):
+        # NS: XCP-ng backups are done via Xen Orchestra, not built-in
+        self.logger.warning(f"backup_vm called for {vmid} but XCP-ng backup not supported via PegaProx")
+        return None
+
+    # alerts compat
+    def get_cluster_summary(self):
+        return self.get_cluster_status()
+
+    def get_resources(self):
+        """Return resources in Proxmox /cluster/resources format."""
+        vms = self.get_vms() or []
+        nodes = self.get_nodes() or []
+        resources = []
+        for n in nodes:
+            resources.append({**n, 'type': 'node', 'id': f"node/{n.get('node', '')}"})
+        for v in vms:
+            resources.append({**v, 'id': f"qemu/{v.get('vmid', '')}"})
+        return resources
+
+    # API token stubs (XAPI uses sessions, not tokens)
+    def create_api_token(self, token_name=''):
+        return None
+
+    def delete_api_token(self, token_name=''):
+        pass
+
+    def get_cluster_fingerprint(self):
+        return None
+
+    # container compat (XCP-ng has no LXC)
+    def create_container(self, node, config):
+        return {'success': False, 'error': 'LXC containers not supported on XCP-ng'}
 
     @property
     def nodes(self):

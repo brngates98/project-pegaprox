@@ -102,10 +102,16 @@ def add_cluster():
     data = request.json
 
     # Validate required fields
-    required = ['name', 'host', 'user', 'pass']
+    required = ['name', 'host', 'user']
     for field in required:
         if field not in data:
             return jsonify({'error': f'Missing required field: {field}'}), 400
+
+    # password or ssh key - need at least one
+    if not data.get('pass') and not data.get('ssh_key'):
+        return jsonify({'error': 'Password or SSH key is required'}), 400
+    if 'pass' not in data:
+        data['pass'] = ''
 
     # Generate unique ID
     cluster_id = str(uuid.uuid4())[:8]
@@ -697,7 +703,7 @@ def get_excluded_vms(cluster_id):
         
         # Get VM names for display
         vms = mgr.get_vm_resources() if mgr.is_connected else []
-        vm_names = {vm['vmid']: vm.get('name', f"VM {vm['vmid']}") for vm in vms}
+        vm_names = {vm['vmid']: vm.get('name', f"VM {vm['vmid']}") for vm in vms if vm.get('vmid')}
         
         for ex in excluded:
             ex['name'] = vm_names.get(ex['vmid'], f"VM {ex['vmid']}")

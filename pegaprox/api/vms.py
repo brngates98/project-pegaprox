@@ -166,35 +166,20 @@ def get_cluster_vms_list(cluster_id):
         except Exception as e:
             return jsonify({'error': safe_error(e, 'Failed to list XCP-ng VMs')}), 500
 
-    try:
-        host = manager.current_host or manager.config.host
-        resources_url = f"https://{host}:8006/api2/json/cluster/resources"
-        resp = manager._create_session().get(resources_url, timeout=10)
-
-        if resp.status_code != 200:
-            return jsonify({'error': 'Failed to fetch resources'}), 500
-
-        resources = resp.json().get('data', [])
-
-        # filter VMs and containers
-        vms = []
-        for r in resources:
-            if r.get('type') in ['qemu', 'lxc']:
-                vms.append({
-                    'vmid': r.get('vmid'),
-                    'name': r.get('name', ''),
-                    'node': r.get('node'),
-                    'type': r.get('type'),
-                    'status': r.get('status', 'unknown')
-                })
-        
-        # sort by vmid
-        vms.sort(key=lambda x: x['vmid'])
-        
-        return jsonify({'vms': vms})
-    except Exception as e:
-        logging.error(f"Error fetching VMs for cluster {cluster_id}: {e}")
-        return jsonify({'error': safe_error(e, 'Failed to list cluster VMs')}), 500
+    # NS: use manager method instead of raw API call - handles timeouts gracefully
+    resources = manager.get_vm_resources()
+    vms = []
+    for r in resources:
+        if r.get('type') in ['qemu', 'lxc'] and r.get('vmid'):
+            vms.append({
+                'vmid': r.get('vmid'),
+                'name': r.get('name', ''),
+                'node': r.get('node'),
+                'type': r.get('type'),
+                'status': r.get('status', 'unknown')
+            })
+    vms.sort(key=lambda x: x.get('vmid', 0))
+    return jsonify({'vms': vms})
 
 
 @bp.route('/api/clusters/<cluster_id>/datacenter/cluster-info', methods=['GET'])
@@ -1966,8 +1951,10 @@ def get_maintenance_status(cluster_id, node_name):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
+    # NS: force-refresh from PVE so we don't return stale data (#141)
+    mgr.refresh_maintenance_status()
     status = mgr.get_maintenance_status(node_name)
-    
+
     return jsonify(status if status else {'maintenance_mode': False})
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance', methods=['DELETE'])

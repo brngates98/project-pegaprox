@@ -1,7 +1,7 @@
 {
-    "version": "0.9.1.1",
-    "build": "2026.03.10",
-    "release_date": "2026-03-10",
+    "version": "0.9.1.2",
+    "build": "2026.03.11",
+    "release_date": "2026-03-11",
     "min_python": "3.8",
     "download_url": "https://github.com/PegaProx/project-pegaprox/releases/latest",
     "update_archive": "https://github.com/PegaProx/project-pegaprox/archive/refs/heads/main.tar.gz",
@@ -157,12 +157,16 @@
         "web/src/vm_modals.js"
     ],
     "changelog": [
-        "Snapshot-based replication for non-ZFS clusters (#103)",
-        "CVE / package vulnerability scanner per node",
-        "Node time/timezone configuration",
-        "Language preference persistence across devices",
-        "Fix cross-cluster migration node dropdown race condition",
-        "Fix local replication exception handler variable scope"
+        "Portuguese (PT-BR) language support (#135)",
+        "Allow cluster creation with SSH key only, no password required (#138)",
+        "CIS hardening: PegaProx recommendations (AppArmor, Disable Services, Sysctl, Auditd)",
+        "CIS hardening: configurable DNS nameservers for backup_dns control",
+        "CIS hardening: reboot-required badge for audit_boot / mem_protection",
+        "CIS hardening: confirmation dialog before applying controls",
+        "Fix maintenance mode detection and Ceph flag handling (#141)",
+        "Fix hardening detection for postfix_banner, default_umask, audit_boot, mem_protection",
+        "Change auto-migrate default to disabled for new clusters (#136)",
+        "XCP-ng feature parity: RRD metrics, guest IPs, pool HA, PIFs"
     ],
     "breaking_changes": []
 }

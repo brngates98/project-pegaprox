@@ -1077,6 +1077,27 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating xcpng_vmid_map table: {e}")
 
+        # LW Mar 2026 - resource pools for XCP-ng (DB-backed, XAPI has no equivalent)
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS xcpng_pools (
+                    cluster_id TEXT NOT NULL,
+                    poolid TEXT NOT NULL,
+                    comment TEXT DEFAULT '',
+                    PRIMARY KEY (cluster_id, poolid)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS xcpng_pool_members (
+                    cluster_id TEXT NOT NULL,
+                    poolid TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    PRIMARY KEY (cluster_id, poolid, vmid)
+                )
+            ''')
+        except Exception as e:
+            logging.error(f"Error creating xcpng_pools tables: {e}")
+
         conn.commit()
         logging.info("DB schema initialized")
     

@@ -1499,7 +1499,7 @@
             const [config, setConfig] = useState({
                 name: '', host: '', user: 'root@pam', pass: '',
                 ssl_verification: false, migration_threshold: 20, check_interval: 300,
-                auto_migrate: true, balance_containers: false, balance_local_disks: false,
+                auto_migrate: false, balance_containers: false, balance_local_disks: false,
                 dry_run: false, ssh_key: '',
             });
             const [showSshSettings, setShowSshSettings] = useState(false);
@@ -1596,7 +1596,7 @@
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-2">{t('passwordOrToken') || t('password')}</label>
-                                    <input type="password" value={config.pass} onChange={e => setConfig({...config, pass: e.target.value})} required
+                                    <input type="password" value={config.pass} onChange={e => setConfig({...config, pass: e.target.value})}
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors"
                                         placeholder={config.user.includes('!') ? 'Token Secret' : 'Password'} />
                                 </div>

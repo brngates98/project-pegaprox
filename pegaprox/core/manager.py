@@ -758,9 +758,23 @@ class PegaProxManager:
             if response.status_code == 200:
                 nodes = response.json()['data']
                 node_status = {}
-                
+
+                # MK: /nodes/{node}/status doesn't have netin/netout, only /cluster/resources does
+                net_by_node = {}
+                try:
+                    res_url = f"https://{host}:8006/api2/json/cluster/resources?type=node"
+                    res_r = self._create_session().get(res_url, timeout=10)
+                    if res_r.status_code == 200:
+                        for nr in res_r.json().get('data', []):
+                            net_by_node[nr.get('node', '')] = {
+                                'netin': nr.get('netin', 0),
+                                'netout': nr.get('netout', 0)
+                            }
+                except Exception:
+                    pass
+
                 api_nodes = set()
-                
+
                 # fetch node details (parallel if gevent available)
                 def fetch_node_details(node):
                     node_name = node['node']
@@ -840,9 +854,10 @@ class PegaProxManager:
                         disk_total = rootfs.get('total', 1)
                         disk_percent = (disk_used / disk_total) * 100 if disk_total > 0 else 0
                         
-                        # Network stats (cumulative bytes)
-                        netin = status_data.get('netin', 0)
-                        netout = status_data.get('netout', 0)
+                        # Network stats from /cluster/resources (cumulative bytes)
+                        node_net = net_by_node.get(node_name, {})
+                        netin = node_net.get('netin', 0)
+                        netout = node_net.get('netout', 0)
                         
                         # Calculate simple score (lower is better)
                         score = cpu_percent + mem_percent
@@ -1163,11 +1178,22 @@ class PegaProxManager:
         
         # Check setting for local disk migration
         balance_local_disks = getattr(self.config, 'balance_local_disks', False)
-        
+
+        # NS: cache target node storages so we can skip VMs whose storage doesn't exist on target
+        target_storage_names = set()
+        if balance_local_disks:
+            try:
+                st_url = f"https://{self.host}:8006/api2/json/nodes/{target_node}/storage"
+                st_r = self._create_session().get(st_url, timeout=10)
+                if st_r.status_code == 200:
+                    target_storage_names = {s['storage'] for s in st_r.json().get('data', []) if s.get('active')}
+            except Exception:
+                pass
+
         # Check each candidate for local disks and filter accordingly
         migratable_candidates = []
         local_disk_candidates = []  # VMs with local disks (need special handling)
-        
+
         for vm in candidates:
             vmid = vm.get('vmid')
             vm_type = vm.get('type')
@@ -1175,7 +1201,11 @@ class PegaProxManager:
             
             if storage_type == 'local':
                 if balance_local_disks:
-                    # Mark as local disk VM for migration with --with-local-disks
+                    # check if target node actually has the storage
+                    vm_stor = self._get_vm_storage(source_node, vmid, vm_type)
+                    if vm_stor and target_storage_names and vm_stor not in target_storage_names:
+                        self.logger.info(f"Skipping {vm.get('name', 'unnamed')} (VMID {vmid}) - storage '{vm_stor}' not on {target_node}")
+                        continue
                     vm['_has_local_disks'] = True
                     local_disk_candidates.append(vm)
                     self.logger.info(f"Found {vm.get('name', 'unnamed')} (VMID {vmid}) with local storage - eligible for migration (balance_local_disks enabled)")
@@ -1285,6 +1315,29 @@ class PegaProxManager:
         
         return available_nodes[0][0]
     
+    def _get_vm_storage(self, node, vmid, vm_type):
+        """Get the primary storage name of a VM/CT (e.g. 'local-lvm')."""
+        try:
+            if vm_type == 'lxc':
+                url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
+            else:
+                url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
+            r = self._create_session().get(url, timeout=10)
+            if r.status_code == 200:
+                cfg = r.json().get('data', {})
+                if vm_type == 'lxc':
+                    rootfs = cfg.get('rootfs', '')
+                    if ':' in rootfs:
+                        return rootfs.split(':')[0]
+                else:
+                    for k in ['scsi0', 'virtio0', 'ide0', 'sata0']:
+                        v = cfg.get(k, '')
+                        if isinstance(v, str) and ':' in v:
+                            return v.split(':')[0]
+        except Exception:
+            pass
+        return None
+
     def migrate_vm(self, vm: Dict, target_node: str, dry_run: bool = None) -> bool:
         """migrate vm to another node"""
         # NS: this handles the proxmox api call
@@ -1331,16 +1384,30 @@ class PegaProxManager:
             else:
                 url = f"https://{self.host}:8006/api2/json/nodes/{source_node}/lxc/{vmid}/migrate"
             
-            data = {
-                'target': target_node,
-                'online': 1
-            }
-            
-            # local disk handling
             has_local_disks = vm.get('_has_local_disks', False)
-            if has_local_disks and vm_type == 'qemu':
-                data['with-local-disks'] = 1
-                self.logger.info(f"using with-local-disks flag")
+
+            if vm_type == 'lxc':
+                # LXC needs restart for migration
+                data = {
+                    'target': target_node,
+                    'restart': 1
+                }
+                if has_local_disks:
+                    stor = self._get_vm_storage(source_node, vmid, 'lxc')
+                    if stor:
+                        data['target-storage'] = stor
+                    self.logger.info(f"container migration with restart, target-storage={stor}")
+            else:
+                data = {
+                    'target': target_node,
+                    'online': 1
+                }
+                if has_local_disks:
+                    data['with-local-disks'] = 1
+                    stor = self._get_vm_storage(source_node, vmid, 'qemu')
+                    if stor:
+                        data['targetstorage'] = stor
+                    self.logger.info(f"local disk migration, targetstorage={stor}")
             
             local_info = ' (local disks)' if has_local_disks else ''
             self.logger.info(f"migrating {vm.get('name', 'unnamed')} ({vmid}) {source_node} -> {target_node}{local_info}")
@@ -1440,11 +1507,14 @@ class PegaProxManager:
         with self.maintenance_lock:
             if node_name in self.nodes_in_maintenance:
                 return self.nodes_in_maintenance[node_name]
-            
+
             task = MaintenanceTask(node_name)
             self.nodes_in_maintenance[node_name] = task
-        
+
         self.logger.info(f"[MAINT] Entering maintenance mode for node: {node_name}")
+
+        # set ceph flags before evacuating (#141)
+        self._set_ceph_maintenance_flags(node_name)
 
         if skip_evacuation:
             # MK: Skip evacuation - for non-reboot updates where user accepts the risk
@@ -1462,6 +1532,73 @@ class PegaProxManager:
             t.start()
 
         return task
+
+    def _set_ceph_maintenance_flags(self, node_name):
+        """Set ceph noout+norebalance before maintenance to prevent unnecessary data movement (#141)"""
+        try:
+            node_ip = self._get_node_ip(node_name)
+            if not node_ip:
+                return
+            # check if ceph is even installed
+            cmd = "which ceph >/dev/null 2>&1 && ceph osd set norebalance 2>&1 && ceph osd add-noout " + node_name + " 2>&1 && echo CEPH_OK || echo CEPH_SKIP"
+            out = self._ssh_node_output(node_name, cmd, timeout=30)
+            if out and 'CEPH_OK' in out:
+                self.logger.info(f"[MAINT] Ceph flags set for {node_name} (norebalance + noout)")
+            else:
+                self.logger.debug(f"[MAINT] No ceph on {node_name} or flags skipped")
+        except Exception as e:
+            self.logger.debug(f"[MAINT] Ceph flag set failed for {node_name}: {e}")
+
+    def _unset_ceph_maintenance_flags(self, node_name):
+        """Remove ceph noout+norebalance after maintenance (#141)"""
+        try:
+            node_ip = self._get_node_ip(node_name)
+            if not node_ip:
+                return
+            cmd = "which ceph >/dev/null 2>&1 && ceph osd rm-noout " + node_name + " 2>&1 && ceph osd unset norebalance 2>&1 && echo CEPH_OK || echo CEPH_SKIP"
+            out = self._ssh_node_output(node_name, cmd, timeout=30)
+            if out and 'CEPH_OK' in out:
+                self.logger.info(f"[MAINT] Ceph flags cleared for {node_name}")
+        except Exception as e:
+            self.logger.debug(f"[MAINT] Ceph flag unset failed for {node_name}: {e}")
+
+    def refresh_maintenance_status(self):
+        """Force-refresh native HA maintenance state from PVE. Call before rolling update checks. (#141)"""
+        try:
+            native_ha_nodes = set()
+            # re-poll /cluster/ha/status/current
+            ha_nodes = self._get_native_ha_maintenance_nodes()
+            native_ha_nodes.update(ha_nodes)
+
+            # also check /nodes status
+            host = self.current_host or self.config.host
+            resp = self._api_get(f"https://{host}:8006/api2/json/nodes")
+            if resp and resp.status_code == 200:
+                for node in resp.json().get('data', []):
+                    if node.get('status') == 'maintenance':
+                        native_ha_nodes.add(node['node'])
+
+            # sync into nodes_in_maintenance
+            for nm in native_ha_nodes:
+                if nm not in self.nodes_in_maintenance:
+                    from pegaprox.models.tasks import MaintenanceTask
+                    t = MaintenanceTask(nm)
+                    t.native_ha = True
+                    t.status = 'completed'
+                    t.total_vms = 0
+                    self.nodes_in_maintenance[nm] = t
+                    self.logger.info(f"[MAINT] refresh: detected maintenance on {nm}")
+
+            # cleanup stale
+            for nm in [n for n, tsk in self.nodes_in_maintenance.items()
+                       if getattr(tsk, 'native_ha', False) and n not in native_ha_nodes]:
+                del self.nodes_in_maintenance[nm]
+                self.logger.info(f"[MAINT] refresh: {nm} no longer in maintenance")
+
+            return native_ha_nodes
+        except Exception as e:
+            self.logger.debug(f"[MAINT] refresh failed: {e}")
+            return set()
 
     def _get_native_ha_maintenance_nodes(self):
         # MK Mar 2026 - polls /cluster/ha/status/current for nodes in native maintenance (#78)
@@ -1619,6 +1756,9 @@ class PegaProxManager:
 
         if native:
             self._try_disable_native_ha_maintenance(node_name)
+
+        # unset ceph flags after maintenance (#141)
+        self._unset_ceph_maintenance_flags(node_name)
         return True
 
     # NS: reverse of _try_native_ha_maintenance
@@ -10872,104 +11012,160 @@ echo "AGENT_INSTALLED_OK"
     # each key maps to a shell snippet that returns 0 if already hardened
     CIS_CHECKS = {
         'fs_modules': {
-            'check': "lsmod | grep -qE '^(cramfs|freevxfs|hfs|hfsplus|jffs2) ' && echo FAIL || echo OK",
-            'apply': """for mod in cramfs freevxfs hfs hfsplus jffs2; do
-echo "install $mod /bin/true" > /etc/modprobe.d/cis-$mod.conf
-rmmod $mod 2>/dev/null || true
-done
+            'check': "[ -f /etc/modprobe.d/cis-disable-modules.conf ] && echo OK || echo FAIL",
+            'apply': """cat > /etc/modprobe.d/cis-disable-modules.conf << 'MODEOF'
+# CIS 1.1.1 & 3.2: Disable unused kernel modules
+install cramfs /bin/false
+blacklist cramfs
+install freevxfs /bin/false
+blacklist freevxfs
+install hfs /bin/false
+blacklist hfs
+install hfsplus /bin/false
+blacklist hfsplus
+install jffs2 /bin/false
+blacklist jffs2
+install atm /bin/false
+blacklist atm
+install can /bin/false
+blacklist can
+install dccp /bin/false
+blacklist dccp
+install sctp /bin/false
+blacklist sctp
+install rds /bin/false
+blacklist rds
+install tipc /bin/false
+blacklist tipc
+MODEOF
 echo DONE""",
         },
         'core_dumps': {
-            'check': """grep -q 'hard.*core.*0' /etc/security/limits.d/*cis* 2>/dev/null && \
-sysctl fs.suid_dumpable 2>/dev/null | grep -q '= 0' && echo OK || echo FAIL""",
-            'apply': """echo '* hard core 0' > /etc/security/limits.d/cis-coredump.conf
-echo 'fs.suid_dumpable = 0' > /etc/sysctl.d/60-cis-coredump.conf
-sysctl -w fs.suid_dumpable=0 >/dev/null
+            'check': """[ -f /etc/systemd/coredump.conf.d/disable-coredump.conf ] && \
+grep -q 'hard core 0' /etc/security/limits.conf 2>/dev/null && echo OK || echo FAIL""",
+            'apply': """mkdir -p /etc/systemd/coredump.conf.d
+cat > /etc/systemd/coredump.conf.d/disable-coredump.conf << 'CDEOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+CDEOF
+if ! grep -q 'hard core 0' /etc/security/limits.conf 2>/dev/null; then
+  echo '* hard core 0' >> /etc/security/limits.conf
+fi
 echo DONE""",
         },
         'mount_options': {
-            'check': """mount | grep ' /tmp ' | grep -q noexec && \
-mount | grep ' /dev/shm ' | grep -q nosuid && echo OK || echo FAIL""",
-            'apply': """# NS: need to handle missing fstab entries, don't brick the box
-cp /etc/fstab /etc/fstab.bak.cis
-for mp in /tmp /var/tmp /dev/shm; do
-  if grep -q " $mp " /etc/fstab; then
-    sed -i "s|\\( $mp .*\\)defaults|\\1defaults,nodev,nosuid,noexec|" /etc/fstab
-  elif [ "$mp" = "/dev/shm" ]; then
-    echo "tmpfs $mp tmpfs defaults,nodev,nosuid,noexec 0 0" >> /etc/fstab
+            'check': """mount | grep ' /dev/shm ' | grep -q noexec && echo OK || echo FAIL""",
+            'apply': """# only secure /dev/shm unconditionally - /tmp /var/tmp need separate partitions
+if ! grep -q '/dev/shm.*noexec' /etc/fstab; then
+  sed -i '/\\/dev\\/shm/d' /etc/fstab
+  echo 'tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0' >> /etc/fstab
+fi
+mount -o remount /dev/shm 2>/dev/null
+# only touch /tmp if it's a separate partition
+if mount | grep -q 'on /tmp type'; then
+  if ! grep -q '/tmp.*noexec' /etc/fstab; then
+    sed -i 's|\\(/tmp.*defaults\\)|\\1,nodev,nosuid,noexec|' /etc/fstab
+    mount -o remount /tmp 2>/dev/null
   fi
-done
-mount -o remount /tmp 2>/dev/null; mount -o remount /dev/shm 2>/dev/null; mount -o remount /var/tmp 2>/dev/null
+fi
 echo DONE""",
         },
         'cron_hardening': {
-            'check': """stat -c '%a' /etc/crontab 2>/dev/null | grep -q '600' && \
+            'check': """stat -c '%a' /etc/crontab 2>/dev/null | grep -q '700' && \
 [ ! -f /etc/cron.deny ] && echo OK || echo FAIL""",
-            'apply': """chmod 600 /etc/crontab
+            'apply': """chmod 700 /etc/crontab
 chmod 700 /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.monthly /etc/cron.weekly 2>/dev/null
 rm -f /etc/cron.deny /etc/at.deny
-touch /etc/cron.allow /etc/at.allow
-chmod 600 /etc/cron.allow /etc/at.allow
+echo 'root' > /etc/cron.allow
+echo 'root' > /etc/at.allow
+chmod 640 /etc/cron.allow /etc/at.allow
 chown root:root /etc/cron.allow /etc/at.allow
 echo DONE""",
         },
         'net_protocols': {
-            'check': "lsmod | grep -qE '^(dccp|sctp|rds|tipc) ' && echo FAIL || echo OK",
-            'apply': """for proto in dccp sctp rds tipc; do
-echo "install $proto /bin/true" > /etc/modprobe.d/cis-$proto.conf
-rmmod $proto 2>/dev/null || true
-done
+            # merged into fs_modules, check kept for backwards compat
+            'check': "[ -f /etc/modprobe.d/cis-disable-modules.conf ] && echo OK || echo FAIL",
+            'apply': """# included in fs_modules control
 echo DONE""",
         },
         'journald': {
-            'check': """journalctl --disk-usage >/dev/null 2>&1 && \
-grep -q 'Storage=persistent' /etc/systemd/journald.conf 2>/dev/null && \
-grep -q 'Compress=yes' /etc/systemd/journald.conf 2>/dev/null && echo OK || echo FAIL""",
-            'apply': """mkdir -p /var/log/journal
-sed -i 's/^#\\?Storage=.*/Storage=persistent/' /etc/systemd/journald.conf
-sed -i 's/^#\\?Compress=.*/Compress=yes/' /etc/systemd/journald.conf
-sed -i 's/^#\\?ForwardToSyslog=.*/ForwardToSyslog=yes/' /etc/systemd/journald.conf
+            'check': """[ -f /etc/systemd/journald.conf.d/99-cis-hardening.conf ] && echo OK || echo FAIL""",
+            'apply': """mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-cis-hardening.conf << 'JDEOF'
+[Journal]
+Storage=persistent
+Compress=yes
+ForwardToSyslog=no
+JDEOF
 systemctl restart systemd-journald
 echo DONE""",
         },
         'ssh_perms': {
             'check': """[ "$(stat -c '%a' /etc/ssh/sshd_config 2>/dev/null)" = "600" ] && echo OK || echo FAIL""",
             'apply': """chmod 600 /etc/ssh/sshd_config
-find /etc/ssh -name 'ssh_host_*_key' -exec chmod 600 {} \\;
-find /etc/ssh -name 'ssh_host_*_key.pub' -exec chmod 644 {} \\;
 chown root:root /etc/ssh/sshd_config
+chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null
+chown root:root /etc/ssh/ssh_host_*_key 2>/dev/null
+chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null
+chown root:root /etc/ssh/ssh_host_*_key.pub 2>/dev/null
 echo DONE""",
         },
         'ssh_crypto': {
-            # LW: only check if our cis config drop-in exists
-            'check': """[ -f /etc/ssh/sshd_config.d/cis-hardening.conf ] && echo OK || echo FAIL""",
-            'apply': """cat > /etc/ssh/sshd_config.d/cis-hardening.conf << 'SSHEOF'
-# CIS SSH Hardening - applied by PegaProx
+            'check': """grep -q 'CIS SSH Cryptographic Hardening' /etc/ssh/sshd_config 2>/dev/null && echo OK || echo FAIL""",
+            'apply': """cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.cis
+# remove existing crypto directives to avoid conflicts
+sed -i -e '/^Ciphers /d' -e '/^KexAlgorithms /d' -e '/^MACs /d' \
+  -e '/^GSSAPIAuthentication /d' -e '/^HostbasedAuthentication /d' \
+  -e '/^IgnoreRhosts /d' -e '/^PermitUserEnvironment /d' \
+  -e '/^Banner /d' /etc/ssh/sshd_config
+cat >> /etc/ssh/sshd_config << 'SSHEOF'
+
+# CIS SSH Cryptographic Hardening (5.1.4-5.1.22) - applied by PegaProx
 Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
 KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
 GSSAPIAuthentication no
 HostbasedAuthentication no
 IgnoreRhosts yes
-PermitEmptyPasswords no
-MaxAuthTries 4
-LoginGraceTime 60
-ClientAliveInterval 300
-ClientAliveCountMax 3
+PermitUserEnvironment no
+Banner /etc/issue.net
 SSHEOF
-if [ -d /etc/ssh/sshd_config.d ]; then
-  grep -q 'Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config 2>/dev/null || echo 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config
+if sshd -t 2>/dev/null; then
+  systemctl restart sshd
+else
+  cp /etc/ssh/sshd_config.bak.cis /etc/ssh/sshd_config
+  systemctl restart sshd
 fi
-sshd -t 2>/dev/null && systemctl reload sshd
 echo DONE""",
         },
         'pam_faillock': {
-            'check': """grep -q 'pam_faillock' /etc/pam.d/common-auth 2>/dev/null && echo OK || echo FAIL""",
-            'apply': """apt-get install -y libpam-modules >/dev/null 2>&1
-if ! grep -q pam_faillock /etc/pam.d/common-auth 2>/dev/null; then
-  cp /etc/pam.d/common-auth /etc/pam.d/common-auth.bak.cis
-  sed -i '/pam_unix.so/i auth    required    pam_faillock.so preauth silent deny=5 unlock_time=600 even_deny_root_account' /etc/pam.d/common-auth
-  sed -i '/pam_unix.so/a auth    [default=die]    pam_faillock.so authfail deny=5 unlock_time=600 even_deny_root_account' /etc/pam.d/common-auth
+            'check': """[ -f /etc/security/faillock.conf.d/cis-faillock.conf ] && echo OK || echo FAIL""",
+            'apply': """mkdir -p /etc/security/faillock.conf.d
+cat > /etc/security/faillock.conf.d/cis-faillock.conf << 'FLEOF'
+# CIS 5.3.3.1: Account lockout - 5 attempts, 10 min unlock
+deny = 5
+unlock_time = 600
+fail_interval = 900
+even_deny_root = false
+dir = /var/run/faillock
+FLEOF
+echo DONE""",
+        },
+        'pw_history': {
+            'check': """grep -q 'pam_pwhistory.so' /etc/pam.d/common-password 2>/dev/null && echo OK || echo FAIL""",
+            'apply': """if ! grep -q pam_pwhistory /etc/pam.d/common-password 2>/dev/null; then
+  if grep -q 'pam_unix.so' /etc/pam.d/common-password 2>/dev/null; then
+    cp /etc/pam.d/common-password /etc/pam.d/common-password.bak.cis
+    sed -i '/pam_unix.so/i password    required    pam_pwhistory.so remember=24 use_authtok' /etc/pam.d/common-password
+    # verify PAM still valid, rollback if broken
+    if ! pam_tally2 --help >/dev/null 2>&1 && ! pamtester --help >/dev/null 2>&1; then
+      # no PAM test tool available, at least verify file not empty
+      if [ ! -s /etc/pam.d/common-password ]; then
+        cp /etc/pam.d/common-password.bak.cis /etc/pam.d/common-password
+      fi
+    fi
+  fi
 fi
 echo DONE""",
         },
@@ -10977,35 +11173,41 @@ echo DONE""",
             'check': """grep -q 'TMOUT=900' /etc/profile.d/cis-timeout.sh 2>/dev/null && echo OK || echo FAIL""",
             'apply': """cat > /etc/profile.d/cis-timeout.sh << 'TMEOF'
 # CIS 5.4.3.2 - shell timeout
-readonly TMOUT=900
+TMOUT=900
+readonly TMOUT
 export TMOUT
 TMEOF
 chmod 644 /etc/profile.d/cis-timeout.sh
 echo DONE""",
         },
         'file_perms': {
-            'check': """[ "$(stat -c '%a' /etc/shadow 2>/dev/null)" = "640" ] || [ "$(stat -c '%a' /etc/shadow 2>/dev/null)" = "600" ] && \
-[ "$(stat -c '%a' /etc/gshadow 2>/dev/null)" = "640" ] || [ "$(stat -c '%a' /etc/gshadow 2>/dev/null)" = "600" ] && echo OK || echo FAIL""",
+            'check': """[ "$(stat -c '%a' /etc/shadow 2>/dev/null)" = "640" ] && \
+[ "$(stat -c '%a' /etc/passwd 2>/dev/null)" = "644" ] && echo OK || echo FAIL""",
             'apply': """chmod 644 /etc/passwd /etc/group
 chmod 640 /etc/shadow /etc/gshadow
 chown root:root /etc/passwd /etc/group
 chown root:shadow /etc/shadow /etc/gshadow
+chmod 644 /etc/passwd- /etc/group- 2>/dev/null
+chmod 640 /etc/shadow- /etc/gshadow- 2>/dev/null
 echo DONE""",
         },
-        # ---- Lynis recommendations below - NS Mar 2026 ----
+        # ---- Lynis recommendations - NS Mar 2026 ----
         'backup_dns': {
             'check': """ns_count=$(grep -c '^nameserver' /etc/resolv.conf 2>/dev/null); [ "$ns_count" -ge 2 ] && echo OK || echo FAIL""",
-            'apply': """if ! grep -q '1.1.1.1' /etc/resolv.conf && [ "$(grep -c '^nameserver' /etc/resolv.conf)" -lt 2 ]; then
-echo 'nameserver 1.1.1.1' >> /etc/resolv.conf
+            # NS: configurable - dns1/dns2 get replaced by apply_node_hardening
+            'apply_template': True,
+            'apply': """if ! grep -q '{dns1}' /etc/resolv.conf && [ "$(grep -c '^nameserver' /etc/resolv.conf)" -lt 2 ]; then
+echo 'nameserver {dns1}' >> /etc/resolv.conf
 fi
-if ! grep -q '9.9.9.9' /etc/resolv.conf && [ "$(grep -c '^nameserver' /etc/resolv.conf)" -lt 3 ]; then
-echo 'nameserver 9.9.9.9' >> /etc/resolv.conf
+if ! grep -q '{dns2}' /etc/resolv.conf && [ "$(grep -c '^nameserver' /etc/resolv.conf)" -lt 3 ]; then
+echo 'nameserver {dns2}' >> /etc/resolv.conf
 fi
 echo DONE""",
+            'defaults': {'dns1': '1.1.1.1', 'dns2': '9.9.9.9'},
         },
         'postfix_banner': {
             'check': """if command -v postconf >/dev/null 2>&1; then
-postconf smtpd_banner 2>/dev/null | grep -qv 'ESMTP' && echo OK || echo FAIL
+postconf smtpd_banner 2>/dev/null | grep -qi 'Postfix' && echo FAIL || echo OK
 else echo OK; fi""",
             'apply': """if command -v postconf >/dev/null 2>&1; then
 postconf -e 'smtpd_banner = $myhostname ESMTP'
@@ -11016,8 +11218,12 @@ echo DONE""",
         'pw_hash_rounds': {
             'check': """grep -q '^SHA_CRYPT_MIN_ROUNDS' /etc/login.defs 2>/dev/null && echo OK || echo FAIL""",
             'apply': """if ! grep -q '^SHA_CRYPT_MIN_ROUNDS' /etc/login.defs; then
-echo 'SHA_CRYPT_MIN_ROUNDS 5000' >> /etc/login.defs
-echo 'SHA_CRYPT_MAX_ROUNDS 500000' >> /etc/login.defs
+cat >> /etc/login.defs << 'HASHEOF'
+
+# Lynis AUTH-9230: Password hashing rounds
+SHA_CRYPT_MIN_ROUNDS 5000
+SHA_CRYPT_MAX_ROUNDS 500000
+HASHEOF
 fi
 echo DONE""",
         },
@@ -11025,11 +11231,16 @@ echo DONE""",
             'check': """dpkg -l libpam-pwquality 2>/dev/null | grep -q '^ii' && echo OK || echo FAIL""",
             'apply': """apt-get install -y libpam-pwquality >/dev/null 2>&1
 cat > /etc/security/pwquality.conf << 'PWEOF'
+# Lynis AUTH-9262: Password quality requirements
 minlen = 12
 dcredit = -1
 ucredit = -1
 lcredit = -1
 ocredit = -1
+minclass = 3
+maxrepeat = 3
+gecoscheck = 1
+dictcheck = 1
 PWEOF
 echo DONE""",
         },
@@ -11037,20 +11248,29 @@ echo DONE""",
             'check': """grep -q '^PASS_MAX_DAYS.*365' /etc/login.defs 2>/dev/null && echo OK || echo FAIL""",
             'apply': """sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   365/' /etc/login.defs
 sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   1/' /etc/login.defs
-sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE   14/' /etc/login.defs
+sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE   30/' /etc/login.defs
+# exclude root from password aging - lockout prevention
+chage -M -1 root 2>/dev/null
+chage -m 0 root 2>/dev/null
 echo DONE""",
         },
         'default_umask': {
-            'check': """grep -qE '^UMASK\\s+027' /etc/login.defs 2>/dev/null && echo OK || echo FAIL""",
-            'apply': """sed -i 's/^UMASK.*/UMASK           027/' /etc/login.defs
-echo 'umask 027' > /etc/profile.d/hardened-umask.sh
-chmod 644 /etc/profile.d/hardened-umask.sh
+            'check': """(grep -q 'UMASK.*027' /etc/login.defs 2>/dev/null || grep -q 'umask 027' /etc/profile 2>/dev/null) && echo OK || echo FAIL""",
+            'apply': """if grep -q '^UMASK' /etc/login.defs 2>/dev/null; then
+  sed -i 's/^UMASK.*/UMASK           027/' /etc/login.defs
+else
+  echo 'UMASK           027' >> /etc/login.defs
+fi
+if ! grep -q '^umask 027' /etc/profile; then
+  echo 'umask 027' >> /etc/profile
+fi
 echo DONE""",
         },
         'pkg_cleanup': {
-            # check if any removed-but-not-purged packages exist
             'check': """dpkg -l | grep -q '^rc' && echo FAIL || echo OK""",
-            'apply': """dpkg -l | grep '^rc' | awk '{print $2}' | xargs dpkg --purge 2>/dev/null
+            'apply': """dpkg -l | grep '^rc' | awk '{print $2}' | xargs -r dpkg --purge 2>/dev/null
+apt-get autoremove -y 2>/dev/null
+apt-get autoclean -y 2>/dev/null
 echo DONE""",
         },
         'debsums': {
@@ -11060,14 +11280,19 @@ echo DONE""",
         },
         'login_banners': {
             'check': """[ -s /etc/issue ] && grep -qi 'authorized' /etc/issue 2>/dev/null && echo OK || echo FAIL""",
-            'apply': """BANNER='Authorized uses only. All activity may be monitored and reported.'
+            'apply': """BANNER='***************************************************************************
+                           AUTHORIZED ACCESS ONLY
+
+This system is for authorized use only. All activities are monitored and
+logged. Unauthorized access will be prosecuted to the fullest extent of law.
+***************************************************************************'
 echo "$BANNER" > /etc/issue
 echo "$BANNER" > /etc/issue.net
 echo DONE""",
         },
         'file_integrity': {
             'check': """command -v aide >/dev/null 2>&1 && echo OK || echo FAIL""",
-            'apply': """DEBIAN_FRONTEND=noninteractive apt-get install -y aide >/dev/null 2>&1
+            'apply': """DEBIAN_FRONTEND=noninteractive apt-get install -y aide aide-common >/dev/null 2>&1
 aideinit 2>/dev/null &
 echo DONE""",
         },
@@ -11080,25 +11305,31 @@ echo DONE""",
         'sysstat': {
             'check': """command -v sar >/dev/null 2>&1 && echo OK || echo FAIL""",
             'apply': """apt-get install -y sysstat >/dev/null 2>&1
-sed -i 's/^ENABLED=.*/ENABLED="true"/' /etc/default/sysstat 2>/dev/null
-systemctl enable sysstat 2>/dev/null; systemctl restart sysstat 2>/dev/null
+sed -i 's/ENABLED="false"/ENABLED="true"/' /etc/default/sysstat 2>/dev/null
+systemctl enable sysstat 2>/dev/null; systemctl start sysstat 2>/dev/null
 echo DONE""",
         },
         'usb_storage': {
-            'check': """[ -f /etc/modprobe.d/cis-usb-storage.conf ] && echo OK || echo FAIL""",
-            'apply': """echo 'install usb-storage /bin/true' > /etc/modprobe.d/cis-usb-storage.conf
-echo 'install firewire-core /bin/true' > /etc/modprobe.d/cis-firewire.conf
+            'check': """[ -f /etc/modprobe.d/disable-storage.conf ] && echo OK || echo FAIL""",
+            'apply': """cat > /etc/modprobe.d/disable-storage.conf << 'USBEOF'
+# Lynis USB-1000/STRG-1846: Disable USB and Firewire storage
+install usb-storage /bin/true
+install firewire-core /bin/true
+install firewire-ohci /bin/true
+install firewire-sbp2 /bin/true
+USBEOF
 rmmod usb-storage 2>/dev/null; rmmod firewire-core 2>/dev/null
 echo DONE""",
         },
         'restrict_compilers': {
             'check': """if command -v gcc >/dev/null 2>&1; then
-stat -c '%a' $(which gcc) 2>/dev/null | grep -q '700' && echo OK || echo FAIL
+stat -c '%a' $(which gcc) 2>/dev/null | grep -qE '(750|700)' && echo OK || echo FAIL
 else echo OK; fi""",
-            'apply': """for comp in gcc g++ cc make; do
-  p=$(which $comp 2>/dev/null)
-  [ -n "$p" ] && chmod 700 "$p"
-done
+            'apply': """chmod 750 /usr/bin/gcc* 2>/dev/null
+chmod 750 /usr/bin/g++* 2>/dev/null
+chmod 750 /usr/bin/cc 2>/dev/null
+chmod 750 /usr/bin/c++ 2>/dev/null
+chmod 750 /usr/bin/make 2>/dev/null
 echo DONE""",
         },
         'apt_show_versions': {
@@ -11113,21 +11344,24 @@ echo DONE""",
         },
         # ---- STIG (DoD) controls - NS Mar 2026 ----
         'session_limit': {
-            'check': """grep -q 'pam_limits.so' /etc/pam.d/common-session 2>/dev/null && \
-grep -q 'maxlogins' /etc/security/limits.d/*stig* 2>/dev/null && echo OK || echo FAIL""",
-            'apply': """echo '* hard maxlogins 10' > /etc/security/limits.d/stig-maxlogins.conf
-# root unlimited for cluster ops
-echo 'root hard maxlogins 0' >> /etc/security/limits.d/stig-maxlogins.conf
-if ! grep -q pam_limits /etc/pam.d/common-session; then
-  echo 'session required pam_limits.so' >> /etc/pam.d/common-session
-fi
+            'check': """grep -q 'maxlogins' /etc/security/limits.conf 2>/dev/null && echo OK || echo FAIL""",
+            'apply': """sed -i '/maxlogins/d' /etc/security/limits.conf 2>/dev/null
+cat >> /etc/security/limits.conf << 'SLEOF'
+
+# STIG UBTU-24-200000: Limit concurrent sessions
+* hard maxlogins 10
+# Root excluded - needs unlimited for system operations
+root hard maxlogins -1
+SLEOF
 echo DONE""",
         },
         'inactive_accounts': {
             'check': """command -v useradd >/dev/null 2>&1 && \
 useradd -D 2>/dev/null | grep -q 'INACTIVE=35' && echo OK || echo FAIL""",
             'apply': """useradd -D -f 35
-# don't touch root, system accounts, or known service accounts
+# exclude root - never auto-disable
+chage -I -1 root 2>/dev/null
+# apply to regular users only
 for user in $(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd); do
   chage -I 35 "$user" 2>/dev/null
 done
@@ -11135,86 +11369,228 @@ echo DONE""",
         },
         'remove_legacy_svcs': {
             'check': """dpkg -l telnet rsh-server rsh-client talk ntalk nis 2>/dev/null | grep -q '^ii' && echo FAIL || echo OK""",
-            'apply': """apt-get purge -y telnet rsh-server rsh-client talk ntalk nis 2>/dev/null
+            'apply': """for pkg in telnet telnetd rsh-server rsh-client talk ntalk nis; do
+  dpkg -l "$pkg" 2>/dev/null | grep -q '^ii' && apt-get remove --purge -y "$pkg" 2>/dev/null
+done
 echo DONE""",
         },
         'audit_boot': {
-            'check': """grep -q 'audit=1' /proc/cmdline && echo OK || echo FAIL""",
+            'check': """(grep -q 'audit=1' /proc/cmdline || grep -q 'audit=1' /etc/default/grub) && echo OK || echo FAIL""",
             'apply': """apt-get install -y auditd >/dev/null 2>&1
-# add to GRUB defaults if not present
 if ! grep -q 'audit=1' /etc/default/grub; then
-  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\\(.*\\)"/GRUB_CMDLINE_LINUX_DEFAULT="\\1 audit=1"/' /etc/default/grub
-  sed -i 's/^GRUB_CMDLINE_LINUX="\\(.*\\)"/GRUB_CMDLINE_LINUX="\\1 audit=1"/' /etc/default/grub
+  CURRENT=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub | cut -d'"' -f2)
+  NEW_PARAMS=$(echo "$CURRENT audit=1" | tr -s ' ')
+  sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\\"$NEW_PARAMS\\"|" /etc/default/grub
   update-grub 2>/dev/null
 fi
 systemctl enable auditd 2>/dev/null; systemctl start auditd 2>/dev/null
 echo DONE""",
         },
         'audit_rules': {
-            # check for our stig rules file
-            'check': """[ -f /etc/audit/rules.d/stig-pegaprox.rules ] && echo OK || echo FAIL""",
+            'check': """[ -f /etc/audit/rules.d/50-stig-extended.rules ] && echo OK || echo FAIL""",
             'apply': """apt-get install -y auditd >/dev/null 2>&1
-cat > /etc/audit/rules.d/stig-pegaprox.rules << 'AUEOF'
+cat > /etc/audit/rules.d/50-stig-extended.rules << 'AUEOF'
 ## STIG Extended Audit Rules - deployed by PegaProx
-# privileged commands
--a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=4294967295 -k priv_cmd
--a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=4294967295 -k priv_cmd
--a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=4294967295 -k priv_cmd
--a always,exit -F path=/usr/bin/chsh -F perm=x -F auid>=1000 -F auid!=4294967295 -k priv_cmd
--a always,exit -F path=/usr/bin/newgrp -F perm=x -F auid>=1000 -F auid!=4294967295 -k priv_cmd
+# buffer + failure mode
+-b 8192
+-f 1
+# privileged command execution
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k execpriv
+-a always,exit -F arch=b32 -S execve -C uid!=euid -F euid=0 -k execpriv
+# specific privileged commands
+-a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/chsh -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/newgrp -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/useradd -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/userdel -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/groupadd -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/groupmod -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
 # permission changes
--a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_chg
--a always,exit -F arch=b64 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=4294967295 -k perm_chg
-# account modifications
--w /etc/passwd -p wa -k acct_mod
--w /etc/shadow -p wa -k acct_mod
--w /etc/group -p wa -k acct_mod
--w /etc/gshadow -p wa -k acct_mod
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b32 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b32 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+# account and identity files
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+# PAM and auth config
+-w /etc/pam.d/ -p wa -k pam_config
+-w /etc/login.defs -p wa -k pam_config
+-w /etc/security/limits.conf -p wa -k pam_config
+# login/logout events
+-w /var/log/faillog -p wa -k logins
+-w /var/log/lastlog -p wa -k logins
+-w /var/log/wtmp -p wa -k logins
+-w /var/log/btmp -p wa -k logins
 # cron changes
--w /etc/crontab -p wa -k cron_mod
--w /etc/cron.d -p wa -k cron_mod
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/cron.daily/ -p wa -k cron
+-w /etc/crontab -p wa -k cron
+-w /var/spool/cron/ -p wa -k cron
 # kernel module loading
--a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k mod_load
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
+-a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules
+-w /sbin/insmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /etc/modprobe.d/ -p wa -k modules
 # network config
--a always,exit -F arch=b64 -S sethostname,setdomainname -k net_cfg
--w /etc/hosts -p wa -k net_cfg
--w /etc/network -p wa -k net_cfg
+-a always,exit -F arch=b64 -S sethostname,setdomainname -k network_config
+-a always,exit -F arch=b32 -S sethostname,setdomainname -k network_config
+-w /etc/hosts -p wa -k network_config
+-w /etc/network/ -p wa -k network_config
+-w /etc/resolv.conf -p wa -k network_config
+# sudoers
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+# SSH config
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+# time changes
+-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time_change
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -k time_change
+-w /etc/localtime -p wa -k time_change
 # proxmox config monitoring
--w /etc/pve/ -p wa -k pve_cfg
+-w /etc/pve/ -p wa -k proxmox_config
+-w /etc/corosync/ -p wa -k proxmox_cluster
 AUEOF
 augenrules --load 2>/dev/null
 echo DONE""",
         },
         'aide_audit_protect': {
-            'check': """[ -f /etc/aide/aide.conf.d/99_stig_audit ] && echo OK || echo FAIL""",
-            'apply': """mkdir -p /etc/aide/aide.conf.d
-cat > /etc/aide/aide.conf.d/99_stig_audit << 'AEOF'
-# STIG - protect audit binaries
-/usr/sbin/auditd p+i+n+u+g+s+b+acl+xattrs+sha512
+            'check': """grep -q 'STIG.*Audit tool integrity' /etc/aide/aide.conf 2>/dev/null && echo OK || \
+[ -f /etc/aide/aide.conf.d/99_stig_audit ] && echo OK || echo FAIL""",
+            'apply': """if [ -f /etc/aide/aide.conf ]; then
+  if ! grep -q 'STIG.*Audit tool integrity' /etc/aide/aide.conf 2>/dev/null; then
+    cat >> /etc/aide/aide.conf << 'AEOF'
+
+# STIG: Audit tool integrity monitoring
 /usr/sbin/auditctl p+i+n+u+g+s+b+acl+xattrs+sha512
+/usr/sbin/auditd p+i+n+u+g+s+b+acl+xattrs+sha512
 /usr/sbin/ausearch p+i+n+u+g+s+b+acl+xattrs+sha512
 /usr/sbin/aureport p+i+n+u+g+s+b+acl+xattrs+sha512
 /usr/sbin/autrace p+i+n+u+g+s+b+acl+xattrs+sha512
 /usr/sbin/augenrules p+i+n+u+g+s+b+acl+xattrs+sha512
 AEOF
+  fi
+fi
 echo DONE""",
         },
         'mem_protection': {
-            'check': """grep -q 'init_on_alloc=1' /proc/cmdline && grep -q 'init_on_free=1' /proc/cmdline && echo OK || echo FAIL""",
-            'apply': """PARAMS='init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 slab_nomerge'
-for p in $PARAMS; do
-  if ! grep -q "$p" /etc/default/grub; then
-    sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 $p\"/" /etc/default/grub
-  fi
+            'check': """GRUB_LINE=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub 2>/dev/null)
+(grep -q 'init_on_alloc=1' /proc/cmdline || echo "$GRUB_LINE" | grep -q 'init_on_alloc=1') && \
+(grep -q 'init_on_free=1' /proc/cmdline || echo "$GRUB_LINE" | grep -q 'init_on_free=1') && echo OK || echo FAIL""",
+            'apply': """CURRENT=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub | cut -d'"' -f2)
+PARAMS_ADD=""
+for p in init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 slab_nomerge; do
+  echo "$CURRENT" | grep -q "$p" || PARAMS_ADD="$PARAMS_ADD $p"
 done
-update-grub 2>/dev/null
+if [ -n "$PARAMS_ADD" ]; then
+  NEW_PARAMS=$(echo "$CURRENT$PARAMS_ADD" | tr -s ' ')
+  sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\\"$NEW_PARAMS\\"|" /etc/default/grub
+  update-grub 2>/dev/null
+fi
 echo DONE""",
         },
         'audit_immutable': {
-            'check': """grep -q '^\-e 2' /etc/audit/rules.d/*immutable* 2>/dev/null && echo OK || echo FAIL""",
-            'apply': """echo '# STIG V-270832 - lock audit rules (reboot to change)' > /etc/audit/rules.d/99-stig-immutable.rules
-echo '-e 2' >> /etc/audit/rules.d/99-stig-immutable.rules
-augenrules --load 2>/dev/null
+            'check': """grep -q '^-e 2' /etc/audit/rules.d/99-finalize.rules 2>/dev/null && echo OK || echo FAIL""",
+            'apply': """cat > /etc/audit/rules.d/99-finalize.rules << 'IMEOF'
+# CIS 6.2.3.36 / STIG V-270832: Make audit configuration immutable
+# This MUST be the last rule loaded - requires reboot to change
+-e 2
+IMEOF
+echo DONE""",
+        },
+        # --- PegaProx Recommendations ---
+        'apparmor': {
+            'check': """systemctl is-active apparmor 2>/dev/null | grep -q active && echo OK || echo FAIL""",
+            'apply': """apt-get install -y apparmor apparmor-utils >/dev/null 2>&1
+systemctl enable --now apparmor 2>/dev/null || true
+aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+echo DONE""",
+        },
+        'disable_services': {
+            'check': """FOUND=0
+for s in bluetooth cups avahi-daemon; do
+  systemctl is-active --quiet $s 2>/dev/null && FOUND=1
+done
+[ $FOUND -eq 0 ] && echo OK || echo FAIL""",
+            'apply': """for s in bluetooth cups avahi-daemon; do
+  if systemctl is-active --quiet $s 2>/dev/null; then
+    systemctl disable --now $s 2>/dev/null || true
+  fi
+done
+echo DONE""",
+        },
+        'sysctl_hardening': {
+            'check': """grep -q 'net.ipv4.conf.all.rp_filter = 1' /etc/sysctl.d/99-pegaprox-hardening.conf 2>/dev/null && echo OK || echo FAIL""",
+            'apply': """cat > /etc/sysctl.d/99-pegaprox-hardening.conf << 'SYSEOF'
+# PegaProx Security Hardening - sysctl parameters
+
+# IP Spoofing protection
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Ignore ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+
+# Don't send redirects
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# Log Martian packets
+net.ipv4.conf.all.log_martians = 1
+
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 5
+
+# ASLR
+kernel.randomize_va_space = 2
+
+# Restrict dmesg
+kernel.dmesg_restrict = 1
+
+# Hide kernel pointers
+kernel.kptr_restrict = 2
+
+# Disable magic SysRq
+kernel.sysrq = 0
+
+# Hardlink/Symlink protection
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+
+# ptrace restriction
+kernel.yama.ptrace_scope = 1
+
+# Core dump protection for SUID
+fs.suid_dumpable = 0
+SYSEOF
+sysctl --system >/dev/null 2>&1
+echo DONE""",
+        },
+        'auditd_service': {
+            'check': """systemctl is-active auditd 2>/dev/null | grep -q active && echo OK || echo FAIL""",
+            'apply': """apt-get install -y auditd audispd-plugins >/dev/null 2>&1
+systemctl enable --now auditd 2>/dev/null
 echo DONE""",
         },
     }
@@ -11247,14 +11623,26 @@ echo DONE""",
 
         return results
 
-    def apply_node_hardening(self, node_name, controls):
+    def apply_node_hardening(self, node_name, controls, params=None):
         """Apply selected CIS controls to a node. Returns per-control results."""
+        import re as _re
         out = {}
         for ctrl_id in controls:
             if ctrl_id not in self.CIS_CHECKS:
                 out[ctrl_id] = {'success': False, 'error': 'unknown control'}
                 continue
-            cmd = self.CIS_CHECKS[ctrl_id]['apply']
+            check = self.CIS_CHECKS[ctrl_id]
+            cmd = check['apply']
+            # MK: templated controls get user-supplied values merged with defaults
+            if check.get('apply_template'):
+                vals = dict(check.get('defaults', {}))
+                if params and ctrl_id in params:
+                    # sanitize - only allow IP-safe chars
+                    for k, v in params[ctrl_id].items():
+                        v = str(v).strip()
+                        if v and _re.match(r'^[\d\.:a-fA-F]+$', v):
+                            vals[k] = v
+                cmd = cmd.format(**vals)
             result = self._ssh_node_output(node_name, cmd, timeout=60)
             if result is not None and 'DONE' in result:
                 out[ctrl_id] = {'success': True}

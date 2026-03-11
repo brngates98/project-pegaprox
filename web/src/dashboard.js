@@ -883,6 +883,7 @@
             const [hardenLoading, setHardenLoading] = useState(false);
             const [hardenApplying, setHardenApplying] = useState(false);
             const [hardenSelected, setHardenSelected] = useState({});
+            const [hardenParams, setHardenParams] = useState({ backup_dns: { dns1: '1.1.1.1', dns2: '9.9.9.9' } });
             const [hardenResults, setHardenResults] = useState(null);
 
             // Custom Scripts state - MK Jan 2026
@@ -1811,22 +1812,25 @@
             
             const createSchedule = async (scheduleData) => {
                 try {
-                    const response = await authFetch(`${API_URL}/schedules`, {
-                        method: 'POST',
+                    // LW: PUT for edit, POST for new (#133)
+                    const isEdit = !!editingSchedule;
+                    const url = isEdit ? `${API_URL}/schedules/${editingSchedule.id}` : `${API_URL}/schedules`;
+                    const response = await authFetch(url, {
+                        method: isEdit ? 'PUT' : 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(scheduleData)
                     });
                     if (response && response.ok) {
                         await loadSchedules();
-                        addToast(t('scheduleCreated') || 'Schedule created', 'success');
+                        addToast(isEdit ? (t('scheduleUpdated') || 'Schedule updated') : (t('scheduleCreated') || 'Schedule created'), 'success');
                         return true;
                     } else {
                         const err = await response.json();
-                        addToast(err.error || 'Failed to create schedule', 'error');
+                        addToast(err.error || 'Failed to save schedule', 'error');
                     }
                 } catch (err) {
-                    console.error('Failed to create schedule:', err);
-                    addToast('Failed to create schedule', 'error');
+                    console.error('Failed to save schedule:', err);
+                    addToast('Failed to save schedule', 'error');
                 }
                 return false;
             };
@@ -2110,13 +2114,15 @@
                 if (!selectedCluster?.id || !hardenNode) return;
                 const toApply = Object.keys(hardenSelected).filter(k => hardenSelected[k]);
                 if (!toApply.length) { addToast(t('noControlsSelected') || 'No controls selected', 'warning'); return; }
+                // NS: warn before modifying system config
+                if (!confirm(`${t('hardenConfirm') || `⚠️ This will apply ${toApply.length} hardening control(s) to "${hardenNode}".\n\nSystem configuration files will be modified. Some changes may require a reboot.\n\nProceed?`}`)) return;
                 setHardenApplying(true);
                 setHardenResults(null);
                 try {
                     const resp = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/nodes/${hardenNode}/hardening`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ controls: toApply })
+                        body: JSON.stringify({ controls: toApply, params: hardenParams })
                     });
                     if (resp && resp.ok) {
                         const data = await resp.json();
@@ -6290,7 +6296,10 @@
                                                                                     {schedule.last_run || '-'}
                                                                                     {schedule.run_count > 0 && ` (${schedule.run_count}x)`}
                                                                                 </td>
-                                                                                <td className="p-3">
+                                                                                <td className="p-3 flex gap-1">
+                                                                                    <button onClick={() => { setEditingSchedule(schedule); setShowScheduleModal(true); }} className="p-1 hover:bg-blue-500/20 rounded text-gray-500 hover:text-blue-400" title="Edit">
+                                                                                        <Icons.Edit className="w-4 h-4" />
+                                                                                    </button>
                                                                                     <button onClick={() => deleteSchedule(schedule.id)} className="p-1 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                                         <Icons.Trash className="w-4 h-4" />
                                                                                     </button>
@@ -6630,11 +6639,12 @@
                                                             };
                                                             // Lynis recommendations
                                                             const lynisControls = {
-                                                                backup_dns: { ref: 'NETW-2705', title: t('lynDns') || 'Backup Nameserver', desc: t('lynDnsDesc') || 'Ensures at least 2 DNS nameservers are configured for redundancy (adds Cloudflare 1.1.1.1 + Quad9 9.9.9.9)', impact: t('lynDnsImpact') || 'Prevents DNS outages' },
+                                                                backup_dns: { ref: 'NETW-2705', title: t('lynDns') || 'Backup Nameserver', desc: t('lynDnsDesc') || 'Ensures at least 2 DNS nameservers are configured for redundancy (configurable)', impact: t('lynDnsImpact') || 'Prevents DNS outages' },
                                                                 postfix_banner: { ref: 'MAIL-8818', title: t('lynPostfix') || 'Postfix Banner Hardening', desc: t('lynPostfixDesc') || 'Removes software version information from mail server banner to prevent version disclosure', impact: t('lynPostfixImpact') || 'None - only hides version string' },
                                                                 pw_hash_rounds: { ref: 'AUTH-9230', title: t('lynPwHash') || 'Password Hashing Rounds', desc: t('lynPwHashDesc') || 'Increases SHA password hashing iterations (5000-500000 rounds), making brute-force attacks significantly slower', impact: t('lynPwHashImpact') || 'Only affects new/changed passwords' },
                                                                 pw_quality: { ref: 'AUTH-9262', title: t('lynPwQuality') || 'PAM Password Quality', desc: t('lynPwQualityDesc') || 'Enforces strong password policies: min 12 chars, uppercase, lowercase, digit, special char. Installs libpam-pwquality.', impact: t('lynPwQualityImpact') || 'Users must set stronger passwords' },
-                                                                pw_aging: { ref: 'AUTH-9286', title: t('lynPwAging') || 'Password Aging', desc: t('lynPwAgingDesc') || 'Forces password changes every 365 days with 14-day warning period', impact: t('lynPwAgingImpact') || 'Users must change passwords annually' },
+                                                                pw_aging: { ref: 'AUTH-9286', title: t('lynPwAging') || 'Password Aging', desc: t('lynPwAgingDesc') || 'Forces password changes every 365 days with 30-day warning period. Root excluded.', impact: t('lynPwAgingImpact') || 'Users must change passwords annually' },
+                                                                pw_history: { ref: 'AUTH-9290', title: t('lynPwHistory') || 'Password History', desc: t('lynPwHistoryDesc') || 'Prevents reuse of the last 24 passwords via pam_pwhistory.', impact: t('lynPwHistoryImpact') || 'Users cannot reuse recent passwords' },
                                                                 default_umask: { ref: 'AUTH-9328', title: t('lynUmask') || 'Default Umask (027)', desc: t('lynUmaskDesc') || 'Tightens default file permissions so new files are only readable by owner and group, not everyone', impact: t('lynUmaskImpact') || 'New files more restrictive by default' },
                                                                 pkg_cleanup: { ref: 'PKGS-7346', title: t('lynPkgCleanup') || 'Old Package Cleanup', desc: t('lynPkgCleanupDesc') || 'Removes leftover configuration files from previously uninstalled packages', impact: t('lynPkgCleanupImpact') || 'None - removes unused config remnants' },
                                                                 debsums: { ref: 'PKGS-7370', title: t('lynDebsums') || 'Package Verification (debsums)', desc: t('lynDebsumsDesc') || 'Installs debsums to verify package file integrity and detect corrupted or tampered system files', impact: t('lynDebsumsImpact') || 'None - read-only verification tool' },
@@ -6652,11 +6662,18 @@
                                                                 session_limit: { ref: 'UBTU-24-200000', title: t('stigSession') || 'Concurrent Session Limit', desc: t('stigSessionDesc') || 'Limits each user to max 10 concurrent login sessions. Root excluded for cluster operations.', impact: t('stigSessionImpact') || 'No impact - root has unlimited sessions' },
                                                                 inactive_accounts: { ref: 'UBTU-24-200260', title: t('stigInactive') || 'Disable Inactive Accounts', desc: t('stigInactiveDesc') || 'Automatically disables user accounts after 35 days without login. Root and service accounts excluded.', impact: t('stigInactiveImpact') || 'Unused accounts disabled after 35 days' },
                                                                 remove_legacy_svcs: { ref: 'UBTU-24-100030', title: t('stigLegacy') || 'Remove Insecure Legacy Services', desc: t('stigLegacyDesc') || 'Removes telnet, rsh, talk, ntalk, nis packages that transmit data including passwords in cleartext', impact: t('stigLegacyImpact') || 'None - Proxmox uses SSH exclusively' },
-                                                                audit_boot: { ref: 'UBTU-24-102010', title: t('stigAuditBoot') || 'Audit at Boot', desc: t('stigAuditBootDesc') || 'Adds audit=1 kernel parameter to enable auditing from the first moment of boot, closing the early-boot logging gap', impact: t('stigAuditBootImpact') || 'Minimal - ~1-2s longer boot time. Reboot required.' },
+                                                                audit_boot: { ref: 'UBTU-24-102010', title: t('stigAuditBoot') || 'Audit at Boot', desc: t('stigAuditBootDesc') || 'Adds audit=1 kernel parameter to enable auditing from the first moment of boot, closing the early-boot logging gap', impact: t('stigAuditBootImpact') || 'Minimal - ~1-2s longer boot time. Reboot required.', reboot: true },
                                                                 audit_rules: { ref: 'Extended', title: t('stigAuditRules') || 'Privileged Command Logging', desc: t('stigAuditRulesDesc') || 'Comprehensive logging of sudo/su/passwd, permission changes, account modifications, kernel module loading, network config, and /etc/pve/ changes', impact: t('stigAuditRulesImpact') || 'Minimal - only audits human users (auid>=1000)' },
                                                                 aide_audit_protect: { ref: 'AIDE+Audit', title: t('stigAideAudit') || 'Audit Tool Protection (AIDE)', desc: t('stigAideAuditDesc') || 'Adds audit binaries (auditd, ausearch, aureport) to AIDE file integrity monitoring with SHA512 checksums. Requires AIDE.', impact: t('stigAideAuditImpact') || 'None - only monitors audit tool binaries' },
-                                                                mem_protection: { ref: 'Kernel', title: t('stigMemProt') || 'Memory Protection - Kernel Hardening', desc: t('stigMemProtDesc') || 'Kernel parameters: init_on_alloc=1, init_on_free=1, page_alloc.shuffle=1, slab_nomerge. Prevents info leaks and use-after-free attacks.', impact: t('stigMemProtImpact') || '~1-3% performance overhead. Reboot required.' },
+                                                                mem_protection: { ref: 'Kernel', title: t('stigMemProt') || 'Memory Protection - Kernel Hardening', desc: t('stigMemProtDesc') || 'Kernel parameters: init_on_alloc=1, init_on_free=1, page_alloc.shuffle=1, slab_nomerge. Prevents info leaks and use-after-free attacks.', impact: t('stigMemProtImpact') || '~1-3% performance overhead. Reboot required.', reboot: true },
                                                                 audit_immutable: { ref: 'V-270832', title: t('stigAuditLock') || 'Audit Rules Immutable', desc: t('stigAuditLockDesc') || 'Locks audit configuration with -e 2 flag. Rules cannot be modified without reboot, preventing attackers from disabling auditing.', impact: t('stigAuditLockImpact') || 'Audit rule changes require reboot' },
+                                                            };
+                                                            // PegaProx recommendations
+                                                            const pegaControls = {
+                                                                apparmor: { ref: 'MAC', title: t('pegaApparmor') || 'AppArmor (Mandatory Access Control)', desc: t('pegaApparmorDesc') || 'Enables AppArmor and enforces all profiles. Restricts what programs can access even if compromised — adds a security layer beyond standard file permissions.', impact: t('pegaApparmorImpact') || 'None for standard PVE — custom services may need profiles' },
+                                                                disable_services: { ref: 'SVC', title: t('pegaDisableSvc') || 'Disable Unnecessary Services', desc: t('pegaDisableSvcDesc') || 'Stops and disables bluetooth, CUPS (printing), and Avahi (mDNS). Fewer running services means less attack surface.', impact: t('pegaDisableSvcImpact') || 'No local printing or Bluetooth — irrelevant for servers' },
+                                                                sysctl_hardening: { ref: 'NET+Kernel', title: t('pegaSysctl') || 'Sysctl Network & Kernel Hardening', desc: t('pegaSysctlDesc') || 'Applies 20+ sysctl parameters: IP spoofing protection, ICMP redirect blocking, SYN flood defense, ASLR, dmesg restriction, ptrace scope, symlink protection.', impact: t('pegaSysctlImpact') || 'None — standard production server hardening' },
+                                                                auditd_service: { ref: 'Audit', title: t('pegaAuditd') || 'Enable Audit Daemon (auditd)', desc: t('pegaAuditdDesc') || 'Installs and enables auditd for system event logging. Pair with STIG "Privileged Command Logging" for comprehensive audit rules.', impact: t('pegaAuditdImpact') || 'Minimal overhead — prerequisite for audit rules' },
                                                             };
                                                             const controls = hardenStatus.controls || {};
                                                             const appliedCount = Object.values(controls).filter(Boolean).length;
@@ -6686,13 +6703,27 @@
                                                                         </div>
                                                                         <div className="flex-1 min-w-0">
                                                                             <div className="flex items-center gap-2 flex-wrap">
-                                                                                <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${source === 'cis' ? 'text-blue-400 bg-blue-500/10' : source === 'lynis' ? 'text-purple-400 bg-purple-500/10' : 'text-amber-400 bg-amber-500/10'}`}>{source === 'cis' ? 'CIS' : source === 'lynis' ? 'Lynis' : 'STIG'} {info.ref}</span>
+                                                                                <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${source === 'cis' ? 'text-blue-400 bg-blue-500/10' : source === 'lynis' ? 'text-purple-400 bg-purple-500/10' : source === 'pega' ? 'text-orange-400 bg-orange-500/10' : 'text-amber-400 bg-amber-500/10'}`}>{source === 'cis' ? 'CIS' : source === 'lynis' ? 'Lynis' : source === 'pega' ? 'PegaProx' : 'STIG'} {info.ref}</span>
                                                                                 <span className="text-sm font-medium text-white">{info.title}</span>
                                                                                 {applied && <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">{t('applied') || 'Applied'}</span>}
+                                                                                {applied && info.reboot && <span className="text-xs bg-orange-500/20 text-orange-400 px-2 py-0.5 rounded font-semibold">{t('rebootRequired') || 'Reboot required'}</span>}
                                                                                 {failed && <span className="text-xs bg-red-500/20 text-red-400 px-2 py-0.5 rounded">{t('failed') || 'Failed'}</span>}
                                                                             </div>
                                                                             <p className="text-xs text-gray-400 mt-1">{info.desc}</p>
                                                                             <p className="text-xs text-gray-600 mt-0.5">{t('pveImpact') || 'PVE Impact'}: {info.impact}</p>
+                                                                            {/* LW: configurable DNS for backup_dns control */}
+                                                                            {id === 'backup_dns' && !applied && (
+                                                                                <div className="flex items-center gap-2 mt-2">
+                                                                                    <span className="text-xs text-gray-500">DNS 1:</span>
+                                                                                    <input type="text" value={hardenParams.backup_dns?.dns1 || '1.1.1.1'}
+                                                                                        onChange={e => setHardenParams(p => ({...p, backup_dns: {...p.backup_dns, dns1: e.target.value}}))}
+                                                                                        className="w-28 px-2 py-0.5 text-xs bg-proxmox-dark border border-proxmox-border rounded text-white" placeholder="1.1.1.1" />
+                                                                                    <span className="text-xs text-gray-500">DNS 2:</span>
+                                                                                    <input type="text" value={hardenParams.backup_dns?.dns2 || '9.9.9.9'}
+                                                                                        onChange={e => setHardenParams(p => ({...p, backup_dns: {...p.backup_dns, dns2: e.target.value}}))}
+                                                                                        className="w-28 px-2 py-0.5 text-xs bg-proxmox-dark border border-proxmox-border rounded text-white" placeholder="9.9.9.9" />
+                                                                                </div>
+                                                                            )}
                                                                         </div>
                                                                     </div>
                                                                 </div>
@@ -6759,6 +6790,17 @@
                                                                     </h3>
                                                                     <div className="space-y-2">
                                                                         {Object.entries(stigControls).map(([id, info]) => renderControl(id, info, 'stig'))}
+                                                                    </div>
+                                                                </div>
+
+                                                                {/* PegaProx Recommendations section */}
+                                                                <div>
+                                                                    <h3 className="text-sm font-semibold text-orange-400 mb-2 flex items-center gap-2">
+                                                                        <Icons.Zap className="w-4 h-4" />
+                                                                        PegaProx {t('recommendations') || 'Recommendations'}
+                                                                    </h3>
+                                                                    <div className="space-y-2">
+                                                                        {Object.entries(pegaControls).map(([id, info]) => renderControl(id, info, 'pega'))}
                                                                     </div>
                                                                 </div>
 
@@ -10765,7 +10807,7 @@
                                         <Icons.X />
                                     </button>
                                 </div>
-                                <form onSubmit={async (e) => {
+                                <form key={editingSchedule?.id || 'new'} onSubmit={async (e) => {
                                     e.preventDefault();
                                     const form = e.target;
                                     const data = {
@@ -10784,18 +10826,20 @@
                                 }} className="p-4 space-y-4">
                                     <div>
                                         <label className="block text-sm text-gray-400 mb-1">{t('name') || 'Name'}</label>
-                                        <input name="name" type="text" placeholder={t('optionalName') || 'Optional name'} 
+                                        <input name="name" type="text" placeholder={t('optionalName') || 'Optional name'}
+                                            defaultValue={editingSchedule?.name || ''}
                                             className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                     </div>
                                     <div className="grid grid-cols-2 gap-4">
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">VMID</label>
-                                            <input name="vmid" type="number" required 
+                                            <input name="vmid" type="number" required
+                                                defaultValue={editingSchedule?.vmid || ''}
                                                 className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                         </div>
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('type') || 'Type'}</label>
-                                            <select name="vm_type" className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
+                                            <select name="vm_type" defaultValue={editingSchedule?.vm_type || 'qemu'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
                                                 <option value="qemu">VM (QEMU)</option>
                                                 <option value="lxc">Container (LXC)</option>
                                             </select>
@@ -10803,7 +10847,7 @@
                                     </div>
                                     <div>
                                         <label className="block text-sm text-gray-400 mb-1">{t('action') || 'Action'}</label>
-                                        <select name="action" required className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
+                                        <select name="action" required defaultValue={editingSchedule?.action || 'start'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
                                             <option value="start">{t('start') || 'Start'}</option>
                                             <option value="stop">{t('stop') || 'Stop'}</option>
                                             <option value="shutdown">{t('shutdown') || 'Shutdown'}</option>
@@ -10814,7 +10858,7 @@
                                     <div className="grid grid-cols-2 gap-4">
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('scheduleType') || 'Schedule Type'}</label>
-                                            <select name="schedule_type" required className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
+                                            <select name="schedule_type" required defaultValue={editingSchedule?.schedule_type || 'daily'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
                                                 <option value="daily">{t('daily') || 'Daily'}</option>
                                                 <option value="weekdays">{t('weekdays') || 'Weekdays'}</option>
                                                 <option value="weekends">{t('weekends') || 'Weekends'}</option>
@@ -10824,13 +10868,15 @@
                                         </div>
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('time') || 'Time'}</label>
-                                            <input name="time" type="time" required 
+                                            <input name="time" type="time" required
+                                                defaultValue={editingSchedule?.time || ''}
                                                 className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                         </div>
                                     </div>
                                     <div>
                                         <label className="block text-sm text-gray-400 mb-1">{t('date') || 'Date'} ({t('forOnce') || 'for once'})</label>
-                                        <input name="date" type="date" 
+                                        <input name="date" type="date"
+                                            defaultValue={editingSchedule?.date || ''}
                                             className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                     </div>
                                     <div>
@@ -10838,7 +10884,8 @@
                                         <div className="flex flex-wrap gap-2">
                                             {['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map(day => (
                                                 <label key={day} className="flex items-center gap-1 text-sm">
-                                                    <input type="checkbox" name="days" value={day} className="rounded" />
+                                                    <input type="checkbox" name="days" value={day} className="rounded"
+                                                        defaultChecked={editingSchedule?.days?.includes(day)} />
                                                     {day.slice(0, 3)}
                                                 </label>
                                             ))}

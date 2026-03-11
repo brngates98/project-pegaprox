@@ -1266,6 +1266,17 @@ def update_server_settings():
             if default_theme in allowed_themes:
                 settings['default_theme'] = default_theme
             
+            # alert recipients from form-data (#131)
+            if 'alert_email_recipients' in request.form:
+                try:
+                    recipients = json.loads(request.form['alert_email_recipients'])
+                    if isinstance(recipients, list):
+                        settings['alert_email_recipients'] = [r.strip() for r in recipients if r.strip()]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if 'alert_cooldown' in request.form:
+                settings['alert_cooldown'] = max(60, min(86400, int(request.form['alert_cooldown'])))
+
             # Handle certificate upload
             if 'ssl_cert' in request.files:
                 cert_file = request.files['ssl_cert']
@@ -2934,14 +2945,16 @@ def check_cluster_updates(cluster_id):
     results = {}
     
     try:
-        host = mgr.current_host or mgr.config.host
-        url = f"https://{host}:8006/api2/json/nodes"
-        r = mgr._create_session().get(url, timeout=10)
-        
-        if r.status_code != 200:
-            return jsonify({'error': 'Failed: nodes from cluster'}), 500
-        
-        nodes_data = r.json().get('data', [])
+        # NS: XCP-ng has get_nodes(), Proxmox uses REST API directly
+        if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+            nodes_data = mgr.get_nodes()
+        else:
+            host = mgr.current_host or mgr.config.host
+            url = f"https://{host}:8006/api2/json/nodes"
+            r = mgr._create_session().get(url, timeout=10)
+            if r.status_code != 200:
+                return jsonify({'error': 'Failed: nodes from cluster'}), 500
+            nodes_data = r.json().get('data', [])
         node_names = [n.get('node') for n in nodes_data if n.get('node') and n.get('status') == 'online']
     except Exception as e:
         return jsonify({'error': f'Failed to connect to cluster: {str(e)}'}), 500
@@ -3176,33 +3189,42 @@ def start_rolling_update(cluster_id):
                 
                 try:
                     # MK: Step 0 - Check if node has updates available (GitHub Issue fix)
+                    is_xcpng = getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng'
                     if skip_up_to_date and not force_all:
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Checking for available updates on {node_name}...")
-                        
-                        # First refresh apt cache
+
+                        # First refresh apt/yum cache
                         try:
                             mgr.refresh_node_apt(node_name)
-                            time.sleep(3)  # Wait for refresh
+                            # NS: yum makecache takes way longer than apt update
+                            time.sleep(10 if is_xcpng else 3)
                         except:
                             pass
-                        
+
+                        check_failed = False
                         try:
                             available_updates = mgr.get_node_apt_updates(node_name)
                         except Exception as e:
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ Failed to check updates on {node_name}: {e}")
                             logging.warning(f"[RollingUpdate] Update check failed for {node_name}: {e}")
                             available_updates = []
+                            check_failed = True
                         update_count = len(available_updates) if available_updates else 0
-                        
-                        if update_count == 0:
+
+                        if update_count == 0 and not check_failed:
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⏭ {node_name} is already up-to-date - SKIPPING")
                             mgr._rolling_update['skipped_nodes'].append(node_name)
                             logging.info(f"[RollingUpdate] Node {node_name} is up-to-date, skipping")
                             continue
+                        elif check_failed:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Check failed, proceeding with update anyway")
                         else:
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Found {update_count} updates available on {node_name}")
                             logging.info(f"[RollingUpdate] Node {node_name} has {update_count} updates available")
                     
+                    # NS: force-refresh maintenance state from PVE before each node (#141)
+                    mgr.refresh_maintenance_status()
+
                     # Step 1: Enable maintenance mode (evacuate VMs unless skip_evacuation is set)
                     mgr._rolling_update['current_step'] = 'maintenance'
                     if skip_evacuation:
@@ -3415,11 +3437,16 @@ def start_rolling_update(cluster_id):
                     logging.error(f"[RollingUpdate] Error updating {node_name}: {e}")
                     mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': safe_error(e, 'Node update failed')})
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ ERROR on {node_name}: {e}")
-                    # Try to exit maintenance mode even if update failed
+                    # always try to exit maintenance + clear ceph flags on failure (#141)
                     try:
-                        mgr.exit_maintenance_mode(node_name)
-                    except:
-                        pass
+                        exited = mgr.exit_maintenance_mode(node_name)
+                        if exited:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Maintenance mode disabled for {node_name} after failure")
+                        else:
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ Could not disable maintenance for {node_name} - check manually")
+                    except Exception as maint_err:
+                        logging.error(f"[RollingUpdate] Failed to exit maintenance on {node_name}: {maint_err}")
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ Failed to exit maintenance on {node_name}: {maint_err}")
             
             # Final summary
             completed = len(mgr._rolling_update['completed_nodes'])
@@ -3601,10 +3628,14 @@ def get_node_repos(cluster_id, node):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    
+
+    # XCP-ng uses yum, not apt - repo management not supported via this endpoint
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+        return jsonify({'error': 'Repository management not available for XCP-ng clusters'}), 400
+
     try:
         host = mgr.current_host or mgr.config.host
-        
+
         # Get all repos via Proxmox API
         file_url = f"https://{host}:8006/api2/json/nodes/{node}/apt/repositories"
         r = mgr._create_session().get(file_url, timeout=10)
@@ -3754,9 +3785,13 @@ def update_node_repo(cluster_id, node, repo_id):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
+
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+        return jsonify({'error': 'Repository management not available for XCP-ng clusters'}), 400
+
     data = request.get_json() or {}
     enabled = data.get('enabled', True)
-    
+
     # Check if this is a known repo or an "other" repo
     if repo_id.startswith('other-'):
         # For "other" repos, we need the file path and index from the request
@@ -3872,11 +3907,19 @@ def refresh_node_repos(cluster_id, node):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    
+
+    # XCP-ng uses yum - use refresh_node_apt which handles both
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+        try:
+            mgr.refresh_node_apt(node)
+            return jsonify({'success': True, 'message': 'Package list refresh started'})
+        except Exception as e:
+            return jsonify({'error': f'Failed to refresh: {str(e)}'}), 500
+
     try:
         host = mgr.current_host or mgr.config.host
         url = f"https://{host}:8006/api2/json/nodes/{node}/apt/update"
-        
+
         r = mgr._create_session().post(url, timeout=30)
         
         if r.status_code == 200:

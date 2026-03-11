@@ -470,6 +470,7 @@ def main(debug_mode=False):
     from pegaprox.background.password_expiry import start_password_expiry_thread
     from pegaprox.background.cross_cluster_lb import start_cross_cluster_lb_thread
     from pegaprox.background.cross_cluster_replication import start_cross_cluster_replication_thread
+    from pegaprox.api.schedules import start_scheduler as start_actions_scheduler
     from pegaprox.api.helpers import load_server_settings
     from pegaprox.utils.rbac import get_pool_membership_cache
     from pegaprox.constants import AUDIT_RETENTION_DAYS
@@ -603,6 +604,11 @@ def main(debug_mode=False):
 
     start_scheduler_thread()
     print("Started task scheduler thread")
+
+    # NS: Mar 2026 - the scheduled_actions scheduler (UI-created schedules, #134)
+    # background/scheduler.py only handles the old scheduled_tasks table
+    start_actions_scheduler()
+    print("Started scheduled actions thread")
 
     start_password_expiry_thread()
     print("Started password expiry check thread")

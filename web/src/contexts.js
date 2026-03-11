@@ -54,6 +54,7 @@
                 { code: 'en', flag: '🇬🇧', label: 'EN', title: 'English' },
                 { code: 'fr', flag: '🇫🇷', label: 'FR', title: 'Français — Coming Soon', soon: true },
                 { code: 'es', flag: '🇪🇸', label: 'ES', title: 'Español — Coming Soon', soon: true },
+                { code: 'pt', flag: '🇧🇷', label: 'PT', title: 'Português' },
             ];
 
             return(
