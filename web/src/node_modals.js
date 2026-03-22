@@ -21,7 +21,7 @@
             const wsRef = useRef(null);
             const termRef = useRef(null);
             const statusRef = useRef('loading');
-            const { sessionId } = useAuth();  // NS: Get session for WebSocket auth
+            const { sessionId, reverseProxyEnabled } = useAuth();
 
             // Keep statusRef in sync
             useEffect(() => {
@@ -161,10 +161,15 @@
                             console.warn('WS token fetch failed, falling back');
                         }
 
-                        // Connect WebSocket - Shell runs on main port + 2
+                        // Connect WebSocket - Shell runs on main port + 2 (unless reverse proxy port set)
                         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                         const mainPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
-                        const sshPortNum = mainPort + 2;
+                        
+                        let sshPortNum = reverseProxyEnabled ? mainPort : mainPort + 2;
+                        if (reverseProxyEnabled) {
+                            console.log(`Using main port for SSH (Reverse Proxy Enabled): ${sshPortNum}`);
+                        }
+
                         setSshPort(sshPortNum);
                         const wsUrl = `${wsProtocol}//${window.location.hostname}:${sshPortNum}/api/clusters/${clusterId}/nodes/${node}/shellws?token=${encodeURIComponent(wsToken)}&ip=${encodeURIComponent(nodeIp)}`;
                         
@@ -2778,7 +2783,7 @@
             const [rfb, setRfb] = useState(null);
             const rfbRef = useRef(null);
             const containerRef = useRef(null);
-            const { getAuthHeaders, sessionId } = useAuth();
+            const { getAuthHeaders, sessionId, reverseProxyEnabled } = useAuth();
 
             useEffect(() => {
                 if(!consoleInfo || !canvasRef.current) return;
@@ -2827,10 +2832,15 @@
                             console.warn('VNC WS token failed');
                         }
 
-                        // Build WebSocket URL - VNC runs on main port + 1
+                        // Build WebSocket URL - VNC runs on main port + 1 (unless reverse proxy port set)
                         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                         const mainPort = parseInt(window.location.port) || (window.location.protocol === 'https:' ? 443 : 80);
-                        const vncPortNum = mainPort + 1;
+                        
+                        let vncPortNum = reverseProxyEnabled ? mainPort : mainPort + 1;
+                        if (reverseProxyEnabled) {
+                            console.log(`Using main port for VNC (Reverse Proxy Enabled): ${vncPortNum}`);
+                        }
+
                         setVncPort(vncPortNum);
                         const wsUrl = `${wsProtocol}//${window.location.hostname}:${vncPortNum}/api/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/vncwebsocket?token=${encodeURIComponent(vncWsToken)}`;
                         
@@ -3155,7 +3165,7 @@
         // LW: Feb 2026 - Corporate Node Detail View (experimental)
         function CorporateNodeDetailView({ node, clusterId, clusterMetrics, clusterResources, onBack, onOpenNodeConfig, onMaintenanceToggle, onNodeAction, onStartUpdate, onSelectVm, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, reverseProxyEnabled } = useAuth();
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [configSubTab, setConfigSubTab] = useState('network');

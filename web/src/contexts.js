@@ -98,6 +98,7 @@
             const [oidcEnabled, setOidcEnabled] = useState(false);  // NS: Feb 2026 - OIDC available
             const [oidcButtonText, setOidcButtonText] = useState('Sign in with Microsoft');
             const [loginBackground, setLoginBackground] = useState('');
+            const [reverseProxyEnabled, setReverseProxyEnabled] = useState(false);
             
             // Check session on mount
             useEffect(() => {
@@ -146,6 +147,10 @@
                             if (userTheme && PEGAPROX_THEMES[userTheme]) {
                                 applyTheme(userTheme);
                             }
+                            // NS: Store reverse proxy status
+                            if (d.reverse_proxy_enabled !== undefined) {
+                                setReverseProxyEnabled(d.reverse_proxy_enabled);
+                            }
                         } else {
                             logout();
                         }
@@ -156,6 +161,7 @@
                             if (errData.ldap_enabled !== undefined) setLdapEnabled(errData.ldap_enabled);
                             if (errData.oidc_enabled !== undefined) { setOidcEnabled(errData.oidc_enabled); setOidcButtonText(errData.oidc_button_text || 'Sign in with Microsoft'); }
                             if (errData.login_background) setLoginBackground(errData.login_background);
+                            if (errData.reverse_proxy_enabled !== undefined) setReverseProxyEnabled(errData.reverse_proxy_enabled);
                         } catch(e) {}
                         logout();
                     }
@@ -212,6 +218,10 @@
                         console.log('[Theme] Login - Server theme:', data.user?.theme, 'Default:', data.default_theme, 'Using:', userTheme);
                         if (userTheme && PEGAPROX_THEMES[userTheme]) {
                             applyTheme(userTheme);
+                        }
+                        // NS: Store reverse proxy status
+                        if (data.reverse_proxy_enabled !== undefined) {
+                            setReverseProxyEnabled(data.reverse_proxy_enabled);
                         }
                         // NS: Security warning for default password
                         if (data.security_warning === 'DEFAULT_PASSWORD') {
@@ -300,7 +310,7 @@
             };
             
             return(
-                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground }}>
+                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled }}>
                     {children}
                 </AuthContext.Provider>
             );
