@@ -185,12 +185,16 @@ def ha_handler():
                 if r.status_code == 404:
                     return jsonify({'error': f'HA resource {sid} not found'}), 404
                 if r.status_code != 200:
-                    return jsonify({'error': f'Proxmox returned {r.status_code}'}), 502
+                    detail = _parse_proxmox_error(r)
+                    status = r.status_code if 400 <= r.status_code < 500 else 502
+                    return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), status
                 return jsonify({'data': r.json().get('data')})
             else:
                 r = manager._api_get(_px_url(manager, '/cluster/ha/resources'))
                 if r.status_code != 200:
-                    return jsonify({'error': f'Proxmox returned {r.status_code}'}), 502
+                    detail = _parse_proxmox_error(r)
+                    status = r.status_code if 400 <= r.status_code < 500 else 502
+                    return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), status
                 return jsonify({'data': r.json().get('data', [])})
         except Exception as e:
             log.exception(f"[{cluster_id}] HA GET error")
@@ -238,7 +242,8 @@ def ha_handler():
             r = manager._api_post(_px_url(manager, '/cluster/ha/resources'), data=payload)
             if r.status_code != 200:
                 detail = _parse_proxmox_error(r)
-                return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), 502
+                status = r.status_code if 400 <= r.status_code < 500 else 502
+                return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), status
         except Exception as e:
             log.exception(f"[{cluster_id}] HA POST error")
             return jsonify({'error': safe_error(e, 'HA add failed')}), 500
@@ -299,7 +304,8 @@ def ha_handler():
             r = manager._api_put(_px_url(manager, f'/cluster/ha/resources/{validated_sid}'), data=payload)
             if r.status_code != 200:
                 detail = _parse_proxmox_error(r)
-                return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), 502
+                status = r.status_code if 400 <= r.status_code < 500 else 502
+                return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), status
         except Exception as e:
             log.exception(f"[{cluster_id}] HA PUT error")
             return jsonify({'error': safe_error(e, 'HA update failed')}), 500
@@ -333,7 +339,8 @@ def ha_handler():
                 return jsonify({'error': f'HA resource {sid} not found'}), 404
             if r.status_code != 200:
                 detail = _parse_proxmox_error(r)
-                return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), 502
+                status = r.status_code if 400 <= r.status_code < 500 else 502
+                return jsonify({'error': f'Proxmox returned {r.status_code}', 'detail': detail}), status
         except Exception as e:
             log.exception(f"[{cluster_id}] HA DELETE error")
             return jsonify({'error': safe_error(e, 'HA remove failed')}), 500
